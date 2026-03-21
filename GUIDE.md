@@ -1,13 +1,13 @@
 # SMART-SSR-CL Guide
 
-This workspace contains the SSR research code under `XMUDeepLIT_SSR/`.
+This workspace contains the SSR research code at the repository root.
 It is a fork/extension of LLaMA-Efficient-Tuning (LLaMA-Factory style) for continual learning experiments from the ACL 2024 SSR paper.
 
 ## 1) What this codebase is
 
 Core training runner:
-- `XMUDeepLIT_SSR/src/train_bash.py` -> calls `llmtuner.run_exp()`
-- `XMUDeepLIT_SSR/src/llmtuner/tuner/tune.py` dispatches by `--stage`
+- `src/train_bash.py` -> calls `llmtuner.run_exp()`
+- `src/llmtuner/tuner/tune.py` dispatches by `--stage`
 
 Supported stages in this fork:
 - `pt` (pretraining)
@@ -17,9 +17,10 @@ Supported stages in this fork:
 - `rm`, `ppo`, `dpo` (inherited from upstream framework)
 
 SSR-specific additions live in:
-- `XMUDeepLIT_SSR/custom/icl_gen/` (synthetic instance generation + labeling)
-- `XMUDeepLIT_SSR/custom/niv2-c012/` (SuperNI filtering/splitting/KMeans subset creation)
-- `XMUDeepLIT_SSR/src/scripts-ni-c012/` (experiment shell scripts)
+- `custom/icl_gen/` (synthetic instance generation + labeling)
+- `custom/niv2-c012/` (SuperNI filtering/splitting/KMeans subset creation)
+- `src/scripts-ni-c012/` (original experiment shell scripts)
+- `scripts/run_basic_ssr_5task.py` and `scripts/run_basic_ssr_5task.sh` (working 5-task SSR runner in this workspace)
 
 ## 2) What experiments are supported
 
@@ -37,10 +38,10 @@ Experiment families (main paper-style):
 - Queue variants: `cl`, `cl2`, `cl3` (different task orders / queues)
 
 Representative script paths:
-- Non-rehearsal: `XMUDeepLIT_SSR/src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue.3ep.bs32x1x1.lr2e-04.bf16.sh`
-- RandSel: `XMUDeepLIT_SSR/src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_rp.3ep.bs32x1x1.lr2e-04.bf16.sh`
-- KMeansSel: `XMUDeepLIT_SSR/src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_km20_rp.3ep.bs32x1x1.lr2e-04.bf16.sh`
-- SSR: `XMUDeepLIT_SSR/src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_iclgen_self.3ep.bs32x1x1.lr2e-04.bf16.sh`
+- Non-rehearsal: `src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue.3ep.bs32x1x1.lr2e-04.bf16.sh`
+- RandSel: `src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_rp.3ep.bs32x1x1.lr2e-04.bf16.sh`
+- KMeansSel: `src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_km20_rp.3ep.bs32x1x1.lr2e-04.bf16.sh`
+- SSR: `src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_iclgen_self.3ep.bs32x1x1.lr2e-04.bf16.sh`
 
 ### B. Multi-task (joint) baselines
 - `lora/all/...all...sh` (all categories)
@@ -49,7 +50,7 @@ Representative script paths:
 ### C. Regularization-based CL baselines
 - `--stage sftreg` with `--reg_cl_method ewc|l2`
 - Example scripts in:
-  - `XMUDeepLIT_SSR/src/scripts-ni-c012/lora/cl/llama2-7b-reg/`
+  - `src/scripts-ni-c012/lora/cl/llama2-7b-reg/`
 
 ### D. Synthetic data generation pipeline (SSR data creation)
 Pipeline in README and custom scripts:
@@ -68,10 +69,10 @@ Pipeline in README and custom scripts:
   - `all_results.json`
   - `generated_predictions.jsonl`
 - MMLU:
-  - `XMUDeepLIT_SSR/mmlu_test/evaluate_causal.py`
-  - demo: `XMUDeepLIT_SSR/mmlu_test/mmlu_demo.sh`
+  - `mmlu_test/evaluate_causal.py`
+  - demo: `mmlu_test/mmlu_demo.sh`
 - AlpacaEval helper:
-  - `XMUDeepLIT_SSR/custom/alpaca_eval/alpaca_demo.sh`
+  - `custom/alpaca_eval/alpaca_demo.sh`
 
 ## 3) Before running: critical path fixes
 
@@ -82,29 +83,83 @@ You must edit at least these variables in each script you use:
 - `MODEL_DIR`
 - any hardcoded data output paths
 
-For this workspace, use:
-- `REPO_ROOT_DIR=/Users/yiannis/work/research/SMART-SSR-CL/XMUDeepLIT_SSR`
+For this workspace, prefer the maintained wrapper instead of patching every historical script:
+- `bash scripts/run_basic_ssr_5task.sh ...`
+
+The working wrapper already handles:
+- sourcing `keys.sh` if present
+- bootstrapping `.venv`
+- training the 5-task queue `qa qg sa sum trans`
+- building synthetic rehearsal files for each completed task
+- evaluating each checkpoint on all tasks seen so far
+
+Compatibility fixes already applied in this repo for the maintained path:
+- lazy imports in `src/llmtuner/__init__.py` so Python 3.12 can train without importing the old FastAPI stack
+- local JSON dataset loading fix in `src/llmtuner/dsets/loader.py`
+- `accelerate<1.0.0` pin in `requirements.txt` for compatibility with `transformers==4.36.0`
 
 ## 4) Environment setup
 
 ```bash
-cd /Users/yiannis/work/research/SMART-SSR-CL/XMUDeepLIT_SSR
+cd /workspace/SSR
 python -m venv .venv
 source .venv/bin/activate
-pip install -U pip
+source keys.sh
+pip install -U pip setuptools wheel
 pip install -r requirements.txt
+pip install -e .
 ```
 
 Notes:
 - Default scripts use `--bf16 True`; you need BF16-capable GPU.
 - If BF16 unsupported, switch scripts/commands to `--fp16 True` and remove `--bf16 True`.
 
-## 5) Minimal way to run core CL experiments
+## 5) Fastest working end-to-end run in this workspace
+
+```bash
+cd /workspace/SSR
+source .venv/bin/activate
+source keys.sh
+
+bash scripts/run_basic_ssr_5task.sh \
+  --model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --output_root saves/basic-ssr-5task \
+  --train_max_steps 2 \
+  --train_max_samples 10 \
+  --eval_max_samples 2 \
+  --prompts_per_group 2 \
+  --max_candidates 5 \
+  --synthesis_max_new_tokens 64 \
+  --refine_max_new_tokens 64
+```
+
+Outputs:
+- checkpoints: `saves/basic-ssr-5task/01_qa` ... `saves/basic-ssr-5task/05_trans`
+- final summary: `saves/basic-ssr-5task/run_summary.json`
+- rehearsal files: `data/ni-cus0.12/genearated-icl-naive-kmeans20-self/llama2-7b-chat/cl_queue/*.json`
+
+To resume after interruption:
+
+```bash
+bash scripts/run_basic_ssr_5task.sh \
+  --model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --output_root saves/basic-ssr-5task \
+  --train_max_steps 2 \
+  --train_max_samples 10 \
+  --eval_max_samples 2 \
+  --prompts_per_group 2 \
+  --max_candidates 5 \
+  --synthesis_max_new_tokens 64 \
+  --refine_max_new_tokens 64 \
+  --skip_completed
+```
+
+## 6) Minimal way to run core CL experiments manually
 
 ### Step 1: train the first task checkpoint (required)
 
 ```bash
-cd /Users/yiannis/work/research/SMART-SSR-CL/XMUDeepLIT_SSR
+cd /workspace/SSR
 CUDA_VISIBLE_DEVICES=0 python src/train_bash.py \
   --stage sft \
   --model_name_or_path /path/to/base/model \
@@ -183,7 +238,7 @@ Metrics are saved in:
 - `<output_dir>/all_results.json`
 - `<output_dir>/generated_predictions.jsonl`
 
-## 6) Running the provided scripts (recommended for full sweeps)
+## 7) Running the provided historical scripts
 
 After editing path variables, run directly:
 
@@ -218,7 +273,9 @@ bash src/scripts-ni-c012/lora/cl2/llama2-7b-chat/llama2-7b-chat.lora.cl_queue2_i
 bash src/scripts-ni-c012/lora/cl3/llama2-7b-chat/llama2-7b-chat.lora.cl_queue3_iclgen_self.3ep.bs32x1x1.lr2e-04.bf16.sh 0
 ```
 
-## 7) How to run SSR synthetic data generation
+These scripts are not the fastest path to a verified working run in this workspace; use `scripts/run_basic_ssr_5task.sh` if you want the maintained path.
+
+## 8) How to run SSR synthetic data generation
 
 Example flow (llama2-chat family):
 
@@ -243,7 +300,7 @@ Important:
 - These scripts also contain hardcoded paths and may need edits before use.
 - Dataset keys referenced by CL scripts are pre-registered in `data/dataset_info.json`.
 
-## 8) Data preprocessing from raw NI (if rebuilding dataset)
+## 9) Data preprocessing from raw NI (if rebuilding dataset)
 
 The `ni-cus0.12` split files are already present. If you need to rebuild:
 
@@ -255,7 +312,7 @@ The `ni-cus0.12` split files are already present. If you need to rebuild:
 - `custom/niv2-c012/text2emb.py`
 - `custom/niv2-c012/kmeans_selection.py`
 
-## 9) Useful outputs to inspect
+## 10) Useful outputs to inspect
 
 - Training logs/metrics per run: inside each `--output_dir`
 - Evaluation metrics: `<output_dir>/all_results.json`
@@ -267,4 +324,3 @@ The `ni-cus0.12` split files are already present. If you need to rebuild:
 - `dataset_info.json` key names must match `--dataset` exactly.
 - `--predict_with_generate True` is required for `sftrp` prediction output.
 - If output directory already exists and is non-empty, set unique `--output_dir` or `--overwrite_output_dir` as needed.
-
