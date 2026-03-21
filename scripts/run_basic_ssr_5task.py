@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+from ssr_metrics import save_aggregate_metrics
+
 
 TASKS = ["qa", "qg", "sa", "sum", "trans"]
 GENERATED_DATA_ROOT = Path(
@@ -168,6 +170,7 @@ def main() -> None:
     parser.add_argument("--max_candidates", type=int, default=20)
     parser.add_argument("--synthesis_max_new_tokens", type=int, default=96)
     parser.add_argument("--refine_max_new_tokens", type=int, default=96)
+    parser.add_argument("--eval_all_tasks", action="store_true", default=False)
     parser.add_argument("--skip_completed", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -216,7 +219,7 @@ def main() -> None:
             refine_max_new_tokens=args.refine_max_new_tokens
         )
 
-        evaluated_tasks = args.tasks[:idx + 1]
+        evaluated_tasks = args.tasks if args.eval_all_tasks else args.tasks[:idx + 1]
         for eval_task in evaluated_tasks:
             run_eval(
                 python_bin=python_bin,
@@ -238,7 +241,9 @@ def main() -> None:
 
     summary_path = output_root / "run_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
+    save_aggregate_metrics(output_root, args.tasks)
     print(f"Saved run summary to {summary_path}.")
+    print(f"Saved aggregate metrics to {output_root / 'aggregate_metrics.json'}.")
 
 
 if __name__ == "__main__":
