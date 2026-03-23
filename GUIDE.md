@@ -21,6 +21,9 @@ SSR-specific additions live in:
 - `custom/niv2-c012/` (SuperNI filtering/splitting/KMeans subset creation)
 - `src/scripts-ni-c012/` (original experiment shell scripts)
 - `scripts/run_basic_ssr_5task.py` and `scripts/run_basic_ssr_5task.sh` (working 5-task SSR runner in this workspace)
+- `scripts/run_paper_ssr_5task.py` (paper-style artifact pipeline)
+- `scripts/selection_methods.py` (selector registry for replay experiments)
+- `scripts/run_selection_proxy_iteration.py` (single-iteration selector replay)
 
 ## 2) What experiments are supported
 
@@ -57,12 +60,15 @@ Pipeline in README and custom scripts:
 1. Generate ICL synthetic instances:
    - `custom/icl_gen/complete_param_nic010_cate.py`
 2. Parse/filter generated outputs:
-   - `custom/icl_gen/parser.py` (or alpaca variant scripts)
-3. Select rehearsal subset:
-   - Random: `custom/icl_gen/random_select.py`
-   - KMeans: `custom/icl_gen/kmeans_self.py` (needs embeddings)
-4. Refine synthetic outputs with current checkpoint:
+   - `custom/icl_gen/parse_filter_generated.py` (or alpaca variant scripts)
+3. Refine synthetic outputs with current checkpoint:
    - `custom/icl_gen/label_param.py`
+4. Select rehearsal subset from the refined outputs:
+   - Legacy random selector: `custom/icl_gen/random_select.py`
+   - Legacy KMeans selector: `custom/icl_gen/kmeans_self.py`
+   - Replay/dev selector path: `scripts/selection_methods.py` plus `scripts/run_selection_proxy_iteration.py`
+
+The maintained paper-style runner still uses the fixed `refined -> kmeans -> cl_queue` path.
 
 ### E. Additional evaluation workflows
 - CL eval in main scripts uses `--stage sftrp` and writes:
@@ -85,6 +91,8 @@ You must edit at least these variables in each script you use:
 
 For this workspace, prefer the maintained wrapper instead of patching every historical script:
 - `bash scripts/run_basic_ssr_5task.sh ...`
+- `python scripts/run_paper_ssr_5task.py ...`
+- `python scripts/run_selection_proxy_iteration.py ...` for selector replay against existing artifacts
 
 The working wrapper already handles:
 - sourcing `keys.sh` if present
@@ -101,7 +109,7 @@ Compatibility fixes already applied in this repo for the maintained path:
 ## 4) Environment setup
 
 ```bash
-cd /workspace/SSR
+cd /workspace/SMART-SSR
 python -m venv .venv
 source .venv/bin/activate
 source keys.sh
@@ -117,7 +125,7 @@ Notes:
 ## 5) Fastest working end-to-end run in this workspace
 
 ```bash
-cd /workspace/SSR
+cd /workspace/SMART-SSR
 source .venv/bin/activate
 source keys.sh
 
@@ -136,7 +144,7 @@ bash scripts/run_basic_ssr_5task.sh \
 Outputs:
 - checkpoints: `saves/basic-ssr-5task/01_qa` ... `saves/basic-ssr-5task/05_trans`
 - final summary: `saves/basic-ssr-5task/run_summary.json`
-- rehearsal files: `data/ni-cus0.12/genearated-icl-naive-kmeans20-self/llama2-7b-chat/cl_queue/*.json`
+- rehearsal files for the default TinyLlama example: `data/ni-cus0.12/genearated-icl-naive-kmeans20-self/tinyllama/cl_queue/*.json`
 
 To resume after interruption:
 
@@ -154,12 +162,58 @@ bash scripts/run_basic_ssr_5task.sh \
   --skip_completed
 ```
 
+### Selector development / single-iteration replay
+
+Use `scripts/run_selection_proxy_iteration.py` when you already have a base SSR run with checkpoints, generated artifacts and `run_summary.json`, and you want to test a different selector on one intermediate stage without regenerating all data.
+
+Built-in selectors in `scripts/selection_methods.py`:
+- `head`
+- `random`
+- `kmeans`
+
+Selector context includes:
+- source task and target task
+- source task index and source checkpoint
+- checkpoint history before the replay target stage
+- candidate artifact path plus normalized candidate rows
+
+Example:
+
+```bash
+cd /workspace/SMART-SSR
+source .venv/bin/activate
+
+python scripts/run_selection_proxy_iteration.py \
+  --base_run saves/paper-ssr-5task-tinyllama \
+  --model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --template llama2 \
+  --iteration_task qg \
+  --selector random \
+  --candidate_source refined \
+  --output_root saves/selection-proxy-tinyllama-qg-random \
+  --train_max_steps 50 \
+  --eval_max_samples 50
+```
+
+Replay outputs:
+- selected rehearsal subsets in `<output_root>/proxy_data/rehearsal/*.jsonl`
+- experiment-local dataset registry in `<output_root>/proxy_data/dataset_info.json`
+- replayed checkpoint and eval outputs under `<output_root>/<stage_name>/`
+- `<output_root>/run_summary.json`
+- `<output_root>/proxy_metrics.json`
+
+Notes:
+- `--candidate_source` accepts `raw`, `parsed`, `refined` or `final`.
+- `--skip_train --skip_eval` materializes only the selected rehearsal subsets.
+- The replay runner uses an experiment-local `dataset_info.json` and does not modify `data/dataset_info.json`.
+- Use this path for fast selector iteration; the maintained paper-style runner still uses the fixed `refined -> kmeans -> cl_queue` selection step.
+
 ## 6) Minimal way to run core CL experiments manually
 
 ### Step 1: train the first task checkpoint (required)
 
 ```bash
-cd /workspace/SSR
+cd /workspace/SMART-SSR
 CUDA_VISIBLE_DEVICES=0 python src/train_bash.py \
   --stage sft \
   --model_name_or_path /path/to/base/model \
@@ -285,16 +339,17 @@ bash custom/icl_gen/scripts-ni-c012/llama2-7b-chat/ori-van.sh 0 "qa qg sa sum tr
 ```
 
 2. Parse/filter generated files:
-- adapt and run `custom/icl_gen/parser.py` (has hardcoded paths)
+- adapt and run `custom/icl_gen/parse_filter_generated.py`
 
-3. Select subset:
-- random: `custom/icl_gen/random_select.py`
-- kmeans: compute embeddings first, then `custom/icl_gen/kmeans_self.py`
-
-4. Refine synthetic outputs using current model:
+3. Refine synthetic outputs using current model:
 ```bash
 bash custom/icl_gen/scripts-ni-c012/llama2-7b-chat/label-self.sh qa 0 "qg sa sum trans"
 ```
+
+4. Select subset from the refined outputs:
+- random: `custom/icl_gen/random_select.py`
+- kmeans: compute embeddings first, then `custom/icl_gen/kmeans_self.py`
+- selector replay/dev path: `scripts/selection_methods.py` with `scripts/run_selection_proxy_iteration.py`
 
 Important:
 - These scripts also contain hardcoded paths and may need edits before use.
@@ -318,9 +373,10 @@ The `ni-cus0.12` split files are already present. If you need to rebuild:
 - Evaluation metrics: `<output_dir>/all_results.json`
 - Predictions: `<output_dir>/generated_predictions.jsonl`
 
-## 10) Common gotchas
+## 11) Common gotchas
 
 - Hardcoded paths in many research scripts are the #1 failure point.
 - `dataset_info.json` key names must match `--dataset` exactly.
+- The replay runner writes its own dataset registry under `<output_root>/proxy_data/dataset_info.json`; do not edit the global registry just to test a selector.
 - `--predict_with_generate True` is required for `sftrp` prediction output.
 - If output directory already exists and is non-empty, set unique `--output_dir` or `--overwrite_output_dir` as needed.

@@ -17,6 +17,7 @@ To get started with SSR, please refer to the following directory tree structure 
 │   └── niv2-c012                   # SuperNI data preprocessing
 ├── data                            # datasets
 ├── mmlu_test
+├── scripts                         # maintained runners, metrics and replay tools
 ├── saves
 └── src
     ├── llmtuner
@@ -43,12 +44,15 @@ source keys.sh
 
 The original paper scripts under `src/scripts-ni-c012/` are useful references, but many of them assume old absolute paths and prebuilt synthetic rehearsal files.
 
-This repository now includes a working end-to-end runner for the basic 5-task SSR queue:
+This repository now includes maintained runners for the main SSR workflows in this workspace:
 
 - tasks: `qa qg sa sum trans`
 - entrypoint: `scripts/run_basic_ssr_5task.sh`
 - Python driver: `scripts/run_basic_ssr_5task.py`
+- paper-style artifact pipeline: `scripts/run_paper_ssr_5task.py`
 - synthetic rehearsal builder: `custom/icl_gen/build_ssr_dataset.py`
+- selector registry for replay experiments: `scripts/selection_methods.py`
+- single-iteration selector replay: `scripts/run_selection_proxy_iteration.py`
 
 Example:
 
@@ -70,10 +74,63 @@ bash scripts/run_basic_ssr_5task.sh \
 
 Notes:
 - The default/tested base model for the working quickstart is `TinyLlama/TinyLlama-1.1B-Chat-v1.0` because it is fast enough to validate the full pipeline in one workspace session.
-- The generated rehearsal JSON files are written under `data/ni-cus0.12/genearated-icl-naive-kmeans20-self/llama2-7b-chat/cl_queue/` so they reuse the dataset keys already registered in `data/dataset_info.json`.
+- The generated rehearsal JSON files are written under `data/ni-cus0.12/genearated-icl-naive-kmeans20-self/<model_family>/cl_queue/`. For the default quickstart, that means `data/ni-cus0.12/genearated-icl-naive-kmeans20-self/tinyllama/cl_queue/`.
 - Final checkpoints and eval outputs are written under `saves/basic-ssr-5task/`.
 - To resume after an interruption, rerun the same command and add `--skip_completed`.
+
+## 🔬 Selector Development And Replay
+
+For fast selection-method iteration, use `scripts/run_selection_proxy_iteration.py` against an existing SSR run that already has:
+
+- stage checkpoints
+- generated artifacts (`raw`, `parsed`, `refined`, `final`)
+- `run_summary.json`
+
+Built-in selectors live in `scripts/selection_methods.py`:
+
+- `head`
+- `random`
+- `kmeans`
+
+Each selector receives a `SelectionContext` with:
+
+- source and target task names
+- source task index and source checkpoint
+- full checkpoint history before the replayed target stage
+- candidate artifact path and normalized candidate rows
+- sample budget, seed, working directory and encoder config
+
+Example replay:
+
+```bash
+source .venv/bin/activate
+
+python scripts/run_selection_proxy_iteration.py \
+  --base_run saves/paper-ssr-5task-tinyllama \
+  --model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --template llama2 \
+  --iteration_task qg \
+  --selector random \
+  --candidate_source refined \
+  --output_root saves/selection-proxy-tinyllama-qg-random \
+  --train_max_steps 50 \
+  --eval_max_samples 50
 ```
+
+Replay outputs:
+
+- selected rehearsal files under `<output_root>/proxy_data/rehearsal/`
+- an experiment-local dataset registry at `<output_root>/proxy_data/dataset_info.json`
+- the replayed stage checkpoint and eval outputs under `<output_root>/<stage_name>/`
+- `run_summary.json`
+- `proxy_metrics.json` with base-vs-replay Rouge-L deltas
+
+Notes:
+
+- `--candidate_source` can be `raw`, `parsed`, `refined` or `final`.
+- `--skip_train --skip_eval` builds only the selected rehearsal subsets.
+- The replay runner does not modify `data/dataset_info.json`.
+- The maintained paper-style runner still uses the fixed `refined -> kmeans -> cl_queue` path. Use the replay runner to test new selectors before wiring them into the full end-to-end pipeline.
 
 ## 🛢 Pipeline
 
@@ -88,17 +145,19 @@ Notes:
 
 ### Step 3: Rehearsal with Selected Synthetic Instances
 
-1. select refined synthetic instances for rehearsal with `custom/icl_gen/random_select.py` or `custom/icl_gen/select_kmeans_examples.py`
-2. for KMeans-based selection, the current implementation clusters using synthetic instance inputs; this reproduces the paper results in this repo, while the pipeline order remains `synthesis -> refinement -> selection`
+1. legacy selection scripts are still available in `custom/icl_gen/random_select.py` and `custom/icl_gen/select_kmeans_examples.py`
+2. selector development now lives in `scripts/selection_methods.py`
+3. fast proxy evaluation of a selector against an existing run lives in `scripts/run_selection_proxy_iteration.py`
+4. the maintained paper-style runner currently keeps the pipeline order `synthesis -> refinement -> selection` and still uses the fixed `refined -> kmeans -> cl_queue` path
 
 - **multi-task learning (MTL)**: `src/scripts-ni-c012/lora/all/[model_name]/[model_name].lora.[all|all_5].3ep.bs32x1x1.bf16.sh`
-- **single task (& Stage 1 in continual learing)**: `src/scripts-ni-c012/lora/sing/[model_name]/[model_name].lora.single.3ep.bs32x1x1.bf16.sh`
+- **single task (& Stage 1 in continual learning)**: `src/scripts-ni-c012/lora/sing/[model_name]/[model_name].lora.single.3ep.bs32x1x1.bf16.sh`
 - **Non-rehearsal**: `src/scripts-ni-c012/lora/[cl|cl2|cl3]/[model_name]/[model_name].lora.[cl_queue|cl_queue2|cl_queue3].3ep.bs32x1x1.lr2e-04.bf16.sh`
 - **RandSel**: `src/scripts-ni-c012/lora/[cl|cl2|cl3]/[model_name]/[model_name].lora.[cl_queue|cl_queue2|cl_queue3]_rp.3ep.bs32x1x1.lr2e-04.bf16.sh`
 - **KMeansSel**: `src/scripts-ni-c012/lora/[cl|cl2|cl3]/[model_name]/[model_name].lora.[cl_queue|cl_queue2|cl_queue3]_km20_rp.3ep.bs32x1x1.lr2e-04.bf16.sh`
 - **SSR**: `src/scripts-ni-c012/lora/[cl|cl2|cl3]/[model_name]/[model_name].lora.[cl_queue|cl_queue2|cl_queue3]_iclgen_self.3ep.bs32x1x1.lr2e-04.bf16.sh`
 
-**NOTE**: You should train **the first task of contiunal learning** using the `single task` script before executing `SSR`/`RandSel`/`KMeansSel`/`Non-rehearsal` scripts.
+**NOTE**: You should train **the first task of continual learning** using the `single task` script before executing `SSR`/`RandSel`/`KMeansSel`/`Non-rehearsal` scripts.
 
 ## 📝 Citation
 

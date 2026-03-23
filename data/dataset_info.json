@@ -718,6 +718,51 @@
       "history": ""
     }
   },
+  "ni_c012_icl_gen_km20_self_cl_queue_tinyllama_qa": {
+    "file_name": "ni-cus0.12/genearated-icl-naive-kmeans20-self/tinyllama/cl_queue/qa.train.smp001.2shot.smp3.rp1.2.json",
+    "columns": {
+      "prompt": "inputs",
+      "query": "",
+      "response": "targets",
+      "history": ""
+    }
+  },
+  "ni_c012_icl_gen_km20_self_cl_queue_tinyllama_qg": {
+    "file_name": "ni-cus0.12/genearated-icl-naive-kmeans20-self/tinyllama/cl_queue/qg.train.smp001.2shot.smp3.rp1.2.json",
+    "columns": {
+      "prompt": "inputs",
+      "query": "",
+      "response": "targets",
+      "history": ""
+    }
+  },
+  "ni_c012_icl_gen_km20_self_cl_queue_tinyllama_sa": {
+    "file_name": "ni-cus0.12/genearated-icl-naive-kmeans20-self/tinyllama/cl_queue/sa.train.smp001.2shot.smp3.rp1.2.json",
+    "columns": {
+      "prompt": "inputs",
+      "query": "",
+      "response": "targets",
+      "history": ""
+    }
+  },
+  "ni_c012_icl_gen_km20_self_cl_queue_tinyllama_sum": {
+    "file_name": "ni-cus0.12/genearated-icl-naive-kmeans20-self/tinyllama/cl_queue/sum.train.smp001.2shot.smp3.rp1.2.json",
+    "columns": {
+      "prompt": "inputs",
+      "query": "",
+      "response": "targets",
+      "history": ""
+    }
+  },
+  "ni_c012_icl_gen_km20_self_cl_queue_tinyllama_trans": {
+    "file_name": "ni-cus0.12/genearated-icl-naive-kmeans20-self/tinyllama/cl_queue/trans.train.smp001.2shot.smp3.rp1.2.json",
+    "columns": {
+      "prompt": "inputs",
+      "query": "",
+      "response": "targets",
+      "history": ""
+    }
+  },
   "ni_c012_icl_gen_km20_self_cl_queue_alpaca_7b_qa": {
     "file_name": "ni-cus0.12/genearated-icl-naive-kmeans20-self/alpaca-7b/cl_queue/qa.train.smp001.2shot.smp3.rp1.2.json",
     "columns": {
