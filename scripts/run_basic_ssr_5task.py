@@ -10,9 +10,22 @@ from ssr_metrics import save_aggregate_metrics
 
 
 TASKS = ["qa", "qg", "sa", "sum", "trans"]
-GENERATED_DATA_ROOT = Path(
-    "data/ni-cus0.12/genearated-icl-naive-kmeans20-self/llama2-7b-chat/cl_queue"
-)
+MODEL_SPECS = {
+    "tinyllama": {
+        "train_template": "llama2",
+        "dataset_key": lambda task: f"ni_c012_icl_gen_km20_self_cl_queue_tinyllama_{task}",
+        "generated_data_root": Path(
+            "data/ni-cus0.12/genearated-icl-naive-kmeans20-self/tinyllama/cl_queue"
+        ),
+    },
+    "llama2-7b-chat": {
+        "train_template": "llama2",
+        "dataset_key": lambda task: f"ni_c012_icl_gen_km20_self_cl_queue_llama2_7b_chat_{task}",
+        "generated_data_root": Path(
+            "data/ni-cus0.12/genearated-icl-naive-kmeans20-self/llama2-7b-chat/cl_queue"
+        ),
+    },
+}
 
 
 def repo_env(cuda: str) -> Dict[str, str]:
@@ -36,14 +49,15 @@ def checkpoint_dir(output_root: Path, task_index: int, task_name: str) -> Path:
     return output_root / f"{task_index + 1:02d}_{task_name}"
 
 
-def rehearsal_file(task_name: str) -> Path:
-    return GENERATED_DATA_ROOT / f"{task_name}.train.smp001.2shot.smp3.rp1.2.json"
+def rehearsal_file(generated_data_root: Path, task_name: str) -> Path:
+    return generated_data_root / f"{task_name}.train.smp001.2shot.smp3.rp1.2.json"
 
 
 def run_train(
     python_bin: str,
     env: Dict[str, str],
     model_name_or_path: str,
+    template: str,
     datasets: List[str],
     checkpoint: Path | None,
     output_dir: Path,
@@ -61,7 +75,7 @@ def run_train(
         "--overwrite_cache", "True",
         "--overwrite_output_dir", "True",
         "--finetuning_type", "lora",
-        "--template", "llama2",
+        "--template", template,
         "--dataset_dir", "data",
         "--dataset", ",".join(datasets),
         "--max_source_length", str(max_source_length),
@@ -93,6 +107,7 @@ def run_eval(
     python_bin: str,
     env: Dict[str, str],
     model_name_or_path: str,
+    template: str,
     checkpoint_dir_path: Path,
     eval_task: str,
     eval_max_samples: int,
@@ -109,7 +124,7 @@ def run_eval(
         "--overwrite_cache", "True",
         "--predict_with_generate", "True",
         "--finetuning_type", "lora",
-        "--template", "llama2",
+        "--template", template,
         "--dataset_dir", "data",
         "--dataset", f"ni_c012_{eval_task}_eval",
         "--max_source_length", str(max_source_length),
@@ -128,14 +143,16 @@ def build_rehearsal_data(
     python_bin: str,
     env: Dict[str, str],
     model_name_or_path: str,
+    template: str,
     task_name: str,
     task_checkpoint_dir: Path,
+    generated_data_root: Path,
     prompts_per_group: int,
     max_candidates: int,
     synthesis_max_new_tokens: int,
     refine_max_new_tokens: int
 ) -> None:
-    output_path = rehearsal_file(task_name)
+    output_path = rehearsal_file(generated_data_root, task_name)
     raw_output_path = output_path.with_suffix(".raw.jsonl")
     command = [
         python_bin,
@@ -145,7 +162,7 @@ def build_rehearsal_data(
         "--input_path", f"data/ni-cus0.12/split/{task_name}.train.smp001.json",
         "--output_path", str(output_path),
         "--raw_output_path", str(raw_output_path),
-        "--template", "llama2",
+        "--template", template,
         "--num_shots", "2",
         "--prompts_per_group", str(prompts_per_group),
         "--max_candidates", str(max_candidates),
@@ -158,6 +175,7 @@ def build_rehearsal_data(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    parser.add_argument("--model_family", choices=sorted(MODEL_SPECS), default="tinyllama")
     parser.add_argument("--output_root", default="saves/basic-ssr-5task")
     parser.add_argument("--tasks", nargs="+", default=TASKS)
     parser.add_argument("--cuda", default="0")
@@ -178,7 +196,9 @@ def main() -> None:
     env = repo_env(args.cuda)
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    GENERATED_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    spec = MODEL_SPECS[args.model_family]
+    generated_data_root = spec["generated_data_root"]
+    generated_data_root.mkdir(parents=True, exist_ok=True)
 
     summary: Dict[str, Dict[str, List[str]]] = {}
 
@@ -189,7 +209,7 @@ def main() -> None:
         train_datasets = [f"ni_c012_{task_name}_train"]
         if idx > 0:
             train_datasets.extend(
-                f"ni_c012_icl_gen_km20_self_cl_queue_llama2_7b_chat_{previous_task}"
+                spec["dataset_key"](previous_task)
                 for previous_task in args.tasks[:idx]
             )
 
@@ -198,6 +218,7 @@ def main() -> None:
                 python_bin=python_bin,
                 env=env,
                 model_name_or_path=args.model_name_or_path,
+                template=spec["train_template"],
                 datasets=train_datasets,
                 checkpoint=previous_checkpoint,
                 output_dir=current_checkpoint,
@@ -211,8 +232,10 @@ def main() -> None:
             python_bin=python_bin,
             env=env,
             model_name_or_path=args.model_name_or_path,
+            template=spec["train_template"],
             task_name=task_name,
             task_checkpoint_dir=current_checkpoint,
+            generated_data_root=generated_data_root,
             prompts_per_group=args.prompts_per_group,
             max_candidates=args.max_candidates,
             synthesis_max_new_tokens=args.synthesis_max_new_tokens,
@@ -225,6 +248,7 @@ def main() -> None:
                 python_bin=python_bin,
                 env=env,
                 model_name_or_path=args.model_name_or_path,
+                template=spec["train_template"],
                 checkpoint_dir_path=current_checkpoint,
                 eval_task=eval_task,
                 eval_max_samples=args.eval_max_samples,
@@ -234,7 +258,7 @@ def main() -> None:
 
         summary[task_name] = {
             "checkpoint_dir": [str(current_checkpoint)],
-            "rehearsal_file": [str(rehearsal_file(task_name))],
+            "rehearsal_file": [str(rehearsal_file(generated_data_root, task_name))],
             "train_datasets": train_datasets,
             "evaluated_tasks": evaluated_tasks
         }

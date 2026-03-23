@@ -9,6 +9,12 @@ from typing import Dict, List
 
 TASKS = ["qa", "qg", "sa", "sum", "trans"]
 MODEL_SPECS = {
+    "tinyllama": {
+        "train_template": "llama2",
+        "gen_template": "vanilla",
+        "model_tag": "tinyllama",
+        "dataset_key": lambda task: f"ni_c012_icl_gen_km20_self_cl_queue_tinyllama_{task}",
+    },
     "llama2-7b-chat": {
         "train_template": "llama2",
         "gen_template": "vanilla",
