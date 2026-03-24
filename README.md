@@ -40,6 +40,9 @@ If you need gated Hugging Face access, source `keys.sh` first:
 source keys.sh
 ```
 
+The maintained shell wrappers now bootstrap `.venv` through `scripts/bootstrap_env.sh`.
+That bootstrap pins a CUDA 12.1 PyTorch build (`torch==2.4.1`) so the repo runs cleanly on the current A100/driver setup in this workspace.
+
 ## 🚀 Working 5-Task SSR Quickstart
 
 The original paper scripts under `src/scripts-ni-c012/` are useful references, but many of them assume old absolute paths and prebuilt synthetic rehearsal files.
@@ -92,6 +95,7 @@ Built-in selectors exposed by the maintained runners:
 - `random`
 - `kmeans`
 - `mean_kl`
+- `uncertainty_band`
 
 Each selector receives a `SelectionContext` with:
 
@@ -132,6 +136,21 @@ python scripts/run_paper_ssr_5task.py \
   --cuda 0
 ```
 
+Default paper-style `llama2-7b-chat` launcher:
+
+```bash
+bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh
+```
+
+Override the selector or resume an interrupted run:
+
+```bash
+bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh \
+  --selector mean_kl \
+  --candidate_source refined \
+  --skip_completed
+```
+
 Replay outputs:
 
 - selected rehearsal files under `<output_root>/proxy_data/rehearsal/`
@@ -146,6 +165,8 @@ Notes:
 - `--skip_train --skip_eval` builds only the selected rehearsal subsets.
 - The replay runner does not modify `data/dataset_info.json`.
 - `mean_kl` supports `--mean_kl_selection_mode global` and `--mean_kl_selection_mode per_task_top_ratio`.
+- `uncertainty_band` supports `--uncertainty_selection_mode global` and `--uncertainty_selection_mode per_task_top_ratio`.
+- `--h_min` and `--h_max` are percentile cutoffs in `[0.0, 1.0]`, not raw entropy values. `0.25` / `0.75` means the middle 50% entropy band of the scored candidate set, or of each source task in `per_task_top_ratio` mode.
 - The maintained paper-style runner now accepts `--selector` and writes stage-local dataset registries under `<output_root>/stage_data/<stage>/dataset_info.json`.
 - The paper-style runner shares only `raw` and `parsed` artifacts across runs. Checkpoint-dependent `refined` and compatibility `final/cl_queue` artifacts are written under `<output_root>/artifacts/`.
 - If you rerun the same `output_root` without `--skip_completed`, the runner refreshes `refined` and `final` for any retrained stage.

@@ -10,12 +10,15 @@ from typing import Dict, List, Mapping
 
 from selection_methods import (
     MEAN_KL_SELECTOR_NAME,
+    UNCERTAINTY_BAND_SELECTOR_NAME,
     PooledCandidate,
     SelectionContext,
     list_methods,
     load_jsonl,
     normalize_candidate_rows,
+    safe_hf_cache_dir,
     score_pooled_candidates_by_mean_kl,
+    score_pooled_candidates_by_uncertainty_band,
     select_rows,
     write_jsonl,
 )
@@ -60,12 +63,48 @@ ARTIFACT_KEY_MAP = {
     "refined": "refined_generation_file",
     "final": "rehearsal_file",
 }
-POOLED_SELECTORS = {MEAN_KL_SELECTOR_NAME}
-MEAN_KL_SELECTION_MODES = ("global", "per_task_top_ratio")
+POOLED_SELECTORS = {MEAN_KL_SELECTOR_NAME, UNCERTAINTY_BAND_SELECTOR_NAME}
+POOLED_SELECTION_MODES = ("global", "per_task_top_ratio")
 
 
 def available_selectors() -> List[str]:
     return sorted(set(list_methods()) | POOLED_SELECTORS)
+
+
+def resolve_pooled_selection_mode(
+    selector: str,
+    mean_kl_selection_mode: str,
+    uncertainty_selection_mode: str,
+) -> str:
+    if selector == MEAN_KL_SELECTOR_NAME:
+        return mean_kl_selection_mode
+    if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+        return uncertainty_selection_mode
+    return "global"
+
+
+def pooled_selection_mode_flag(selector: str) -> str:
+    if selector == MEAN_KL_SELECTOR_NAME:
+        return "--mean_kl_selection_mode"
+    if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+        return "--uncertainty_selection_mode"
+    raise ValueError(f"Selector `{selector}` is not a pooled selector.")
+
+
+def pooled_selection_mode_field(selector: str) -> str:
+    if selector == MEAN_KL_SELECTOR_NAME:
+        return "mean_kl_selection_mode"
+    if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+        return "uncertainty_selection_mode"
+    raise ValueError(f"Selector `{selector}` is not a pooled selector.")
+
+
+def pooled_score_field(selector: str) -> str:
+    if selector == MEAN_KL_SELECTOR_NAME:
+        return "mean_kl"
+    if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+        return "uncertainty_band_score"
+    raise ValueError(f"Selector `{selector}` is not a pooled selector.")
 
 
 def repo_env(cuda: str) -> Dict[str, str]:
@@ -77,6 +116,16 @@ def repo_env(cuda: str) -> Dict[str, str]:
     env["LOCAL_RANK"] = "-1"
     env.pop("RANK", None)
     env.pop("WORLD_SIZE", None)
+    safe_cache_root = safe_hf_cache_dir()
+    hub_cache = os.path.join(safe_cache_root, "hub")
+    transformers_cache = os.path.join(safe_cache_root, "transformers")
+    os.makedirs(hub_cache, exist_ok=True)
+    os.makedirs(transformers_cache, exist_ok=True)
+    env["SMART_SSR_HF_CACHE"] = safe_cache_root
+    env["HF_HOME"] = safe_cache_root
+    env["HF_HUB_CACHE"] = hub_cache
+    env["HUGGINGFACE_HUB_CACHE"] = hub_cache
+    env["TRANSFORMERS_CACHE"] = transformers_cache
     return env
 
 
@@ -466,11 +515,14 @@ def select_stage_rehearsal_files(
     encoder_model_name_or_path: str,
     global_selection_count: int | None,
     global_selection_ratio: float | None,
-    mean_kl_selection_mode: str,
+    pooled_selection_mode: str,
     per_task_selection_ratio: float | None,
     max_source_length: int,
     max_target_length: int,
     kl_batch_size: int,
+    uncertainty_batch_size: int,
+    h_min: float,
+    h_max: float,
 ) -> tuple[Dict[str, Path], Dict[str, Dict[str, object]], Dict[str, object] | None]:
     previous_tasks = tasks[:target_index]
     if not previous_tasks:
@@ -521,7 +573,7 @@ def select_stage_rehearsal_files(
 
         selection_ratio_applied: float | None = None
         per_task_budgets: Dict[str, int] | None = None
-        if mean_kl_selection_mode == "global":
+        if pooled_selection_mode == "global":
             budget = resolve_global_selection_budget(
                 num_candidates=len(pooled_candidates),
                 num_previous_tasks=len(previous_tasks),
@@ -529,11 +581,11 @@ def select_stage_rehearsal_files(
                 global_selection_count=global_selection_count,
                 global_selection_ratio=global_selection_ratio,
             )
-        elif mean_kl_selection_mode == "per_task_top_ratio":
+        elif pooled_selection_mode == "per_task_top_ratio":
             if global_selection_count is not None or global_selection_ratio is not None:
                 raise ValueError(
                     "--global_selection_count/--global_selection_ratio cannot be used with "
-                    "--mean_kl_selection_mode per_task_top_ratio."
+                    f"{pooled_selection_mode_flag(selector)} per_task_top_ratio."
                 )
             selection_ratio_applied = validate_selection_ratio(
                 "--per_task_selection_ratio",
@@ -546,19 +598,56 @@ def select_stage_rehearsal_files(
             budget = sum(per_task_budgets.values())
         else:
             raise ValueError(
-                f"Unknown mean KL selection mode `{mean_kl_selection_mode}`. "
-                f"Available modes: {', '.join(MEAN_KL_SELECTION_MODES)}"
+                f"Unknown pooled selection mode `{pooled_selection_mode}` for selector `{selector}`. "
+                f"Available modes: {', '.join(POOLED_SELECTION_MODES)}"
             )
 
-        scored_candidates = score_pooled_candidates_by_mean_kl(
-            model_name_or_path=model_name_or_path,
-            current_checkpoint=previous_checkpoint,
-            pooled_candidates=pooled_candidates,
-            template_name=template,
-            max_source_length=max_source_length,
-            max_target_length=max_target_length,
-            batch_size=kl_batch_size,
-        )
+        score_field = pooled_score_field(selector)
+        uncertainty_band_by_task: Dict[str, Dict[str, float]] = {}
+        scoring_metadata: Dict[str, object]
+        if selector == MEAN_KL_SELECTOR_NAME:
+            scored_candidates = score_pooled_candidates_by_mean_kl(
+                model_name_or_path=model_name_or_path,
+                current_checkpoint=previous_checkpoint,
+                pooled_candidates=pooled_candidates,
+                template_name=template,
+                max_source_length=max_source_length,
+                max_target_length=max_target_length,
+                batch_size=kl_batch_size,
+            )
+            scoring_metadata = {
+                "kl_batch_size": kl_batch_size,
+            }
+        elif selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+            uncertainty_result = score_pooled_candidates_by_uncertainty_band(
+                model_name_or_path=model_name_or_path,
+                current_checkpoint=previous_checkpoint,
+                pooled_candidates=pooled_candidates,
+                template_name=template,
+                max_source_length=max_source_length,
+                max_target_length=max_target_length,
+                selection_mode=pooled_selection_mode,
+                h_min=h_min,
+                h_max=h_max,
+                batch_size=uncertainty_batch_size,
+            )
+            scored_candidates = uncertainty_result.scored_candidates
+            uncertainty_band_by_task = {
+                source_task: dict(task_metadata)
+                for source_task, task_metadata in uncertainty_result.band_by_source_task.items()
+            }
+            scoring_metadata = {
+                "uncertainty_batch_size": uncertainty_batch_size,
+                "h_min": h_min,
+                "h_max": h_max,
+                "mean_entropy_min": uncertainty_result.entropy_min,
+                "mean_entropy_max": uncertainty_result.entropy_max,
+                "entropy_band_min": uncertainty_result.band_min_entropy,
+                "entropy_band_max": uncertainty_result.band_max_entropy,
+                "entropy_bands_by_task": uncertainty_band_by_task,
+            }
+        else:
+            raise ValueError(f"Selector `{selector}` is not a pooled selector.")
 
         ranked_score_path = stage_score_path(
             output_root,
@@ -570,28 +659,36 @@ def select_stage_rehearsal_files(
         ranked_rows: List[Dict[str, object]] = []
         all_scores_by_task: Dict[str, List[float]] = defaultdict(list)
         selected_scores_by_task: Dict[str, List[float]] = defaultdict(list)
+        selected_entropies_by_task: Dict[str, List[float]] = defaultdict(list)
         selected_rows_by_task: Dict[str, List[Dict[str, str]]] = defaultdict(list)
         selected_counts_by_task: Dict[str, int] = defaultdict(int)
 
         for rank, scored_candidate in enumerate(scored_candidates, start=1):
             candidate = scored_candidate.candidate
-            score = scored_candidate.mean_kl
+            score = scored_candidate.score
             all_scores_by_task[candidate.source_task].append(score)
-            ranked_rows.append(
-                {
-                    "rank": rank,
-                    "source_task": candidate.source_task,
-                    "source_task_index": candidate.source_task_index,
-                    "source_checkpoint": str(candidate.source_checkpoint),
-                    "candidate_index": candidate.candidate_index,
-                    "mean_kl": score,
-                    "inputs": candidate.row["inputs"],
-                    "targets": candidate.row["targets"],
-                }
-            )
+            ranked_row = {
+                "rank": rank,
+                "source_task": candidate.source_task,
+                "source_task_index": candidate.source_task_index,
+                "source_checkpoint": str(candidate.source_checkpoint),
+                "candidate_index": candidate.candidate_index,
+                score_field: score,
+                "inputs": candidate.row["inputs"],
+                "targets": candidate.row["targets"],
+            }
+            if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+                if scored_candidate.mean_entropy is None:
+                    raise ValueError("Uncertainty scoring must populate mean entropy.")
+                ranked_row["mean_entropy"] = scored_candidate.mean_entropy
+                task_band = uncertainty_band_by_task.get(candidate.source_task)
+                if task_band is not None:
+                    ranked_row["entropy_band_min"] = task_band["band_min_entropy"]
+                    ranked_row["entropy_band_max"] = task_band["band_max_entropy"]
+            ranked_rows.append(ranked_row)
 
             should_select = False
-            if mean_kl_selection_mode == "global":
+            if pooled_selection_mode == "global":
                 should_select = rank <= budget
             else:
                 assert per_task_budgets is not None
@@ -604,6 +701,11 @@ def select_stage_rehearsal_files(
                 selected_rows_by_task[candidate.source_task].append(candidate.row)
                 selected_scores_by_task[candidate.source_task].append(score)
                 selected_counts_by_task[candidate.source_task] += 1
+                if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+                    assert scored_candidate.mean_entropy is not None
+                    selected_entropies_by_task[candidate.source_task].append(
+                        scored_candidate.mean_entropy
+                    )
 
         write_jsonl(ranked_score_path, ranked_rows)
 
@@ -626,7 +728,7 @@ def select_stage_rehearsal_files(
                 "candidate_source": candidate_source,
                 "history_checkpoints": [str(path) for path in history_checkpoints],
                 "selector": selector,
-                "mean_kl_selection_mode": mean_kl_selection_mode,
+                pooled_selection_mode_field(selector): pooled_selection_mode,
                 "current_checkpoint": str(previous_checkpoint),
                 "num_candidates": candidate_counts[source_task],
                 "selected_count": len(selected_rows),
@@ -636,16 +738,35 @@ def select_stage_rehearsal_files(
                     if per_task_budgets is None
                     else per_task_budgets[source_task]
                 ),
-                "mean_kl_min": min(source_scores) if source_scores else None,
-                "mean_kl_max": max(source_scores) if source_scores else None,
-                "selected_mean_kl_min": min(chosen_scores) if chosen_scores else None,
-                "selected_mean_kl_max": max(chosen_scores) if chosen_scores else None,
+                f"{score_field}_min": min(source_scores) if source_scores else None,
+                f"{score_field}_max": max(source_scores) if source_scores else None,
+                f"selected_{score_field}_min": min(chosen_scores) if chosen_scores else None,
+                f"selected_{score_field}_max": max(chosen_scores) if chosen_scores else None,
             }
+            if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+                task_band = uncertainty_band_by_task.get(source_task, {})
+                chosen_entropies = selected_entropies_by_task.get(source_task, [])
+                selection_metadata[source_task].update(
+                    {
+                        "h_min": h_min,
+                        "h_max": h_max,
+                        "mean_entropy_min": task_band.get("entropy_min"),
+                        "mean_entropy_max": task_band.get("entropy_max"),
+                        "selected_mean_entropy_min": (
+                            min(chosen_entropies) if chosen_entropies else None
+                        ),
+                        "selected_mean_entropy_max": (
+                            max(chosen_entropies) if chosen_entropies else None
+                        ),
+                        "entropy_band_min": task_band.get("band_min_entropy"),
+                        "entropy_band_max": task_band.get("band_max_entropy"),
+                    }
+                )
 
         selection_pool_metadata = {
             "selector": selector,
             "candidate_source": candidate_source,
-            "mean_kl_selection_mode": mean_kl_selection_mode,
+            pooled_selection_mode_field(selector): pooled_selection_mode,
             "current_checkpoint": str(previous_checkpoint),
             "num_candidates_total": len(pooled_candidates),
             "selected_count_total": budget,
@@ -654,8 +775,8 @@ def select_stage_rehearsal_files(
             "global_selection_ratio": global_selection_ratio,
             "per_task_selection_ratio": selection_ratio_applied,
             "per_task_selection_budgets": per_task_budgets,
-            "kl_batch_size": kl_batch_size,
             "score_path": str(ranked_score_path),
+            **scoring_metadata,
         }
         return rehearsal_files, selection_metadata, selection_pool_metadata
 
@@ -770,11 +891,19 @@ def main() -> None:
     parser.add_argument("--global_selection_ratio", type=float)
     parser.add_argument(
         "--mean_kl_selection_mode",
-        choices=MEAN_KL_SELECTION_MODES,
+        choices=POOLED_SELECTION_MODES,
+        default="global",
+    )
+    parser.add_argument(
+        "--uncertainty_selection_mode",
+        choices=POOLED_SELECTION_MODES,
         default="global",
     )
     parser.add_argument("--per_task_selection_ratio", type=float)
     parser.add_argument("--kl_batch_size", type=int, default=1)
+    parser.add_argument("--uncertainty_batch_size", type=int, default=1)
+    parser.add_argument("--h_min", "--uncertainty_h_min", dest="h_min", type=float, default=0.25)
+    parser.add_argument("--h_max", "--uncertainty_h_max", dest="h_max", type=float, default=0.75)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_source_length", type=int, default=1024)
     parser.add_argument("--max_target_length", type=int, default=512)
@@ -792,6 +921,11 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     spec = MODEL_SPECS[args.model_family]
     candidate_source = resolve_candidate_source(args.selector, args.candidate_source)
+    pooled_selection_mode = resolve_pooled_selection_mode(
+        args.selector,
+        args.mean_kl_selection_mode,
+        args.uncertainty_selection_mode,
+    )
 
     summary: Dict[str, Dict[str, object]] = {}
 
@@ -843,11 +977,14 @@ def main() -> None:
                 encoder_model_name_or_path=args.encoder_model_name_or_path,
                 global_selection_count=args.global_selection_count,
                 global_selection_ratio=args.global_selection_ratio,
-                mean_kl_selection_mode=args.mean_kl_selection_mode,
+                pooled_selection_mode=pooled_selection_mode,
                 per_task_selection_ratio=args.per_task_selection_ratio,
                 max_source_length=args.max_source_length,
                 max_target_length=args.max_target_length,
                 kl_batch_size=args.kl_batch_size,
+                uncertainty_batch_size=args.uncertainty_batch_size,
+                h_min=args.h_min,
+                h_max=args.h_max,
             )
         rehearsal_dataset_keys = write_dataset_registry(
             current_stage_dataset_dir,

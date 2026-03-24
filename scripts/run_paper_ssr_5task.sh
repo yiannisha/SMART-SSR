@@ -14,17 +14,10 @@ if [[ -n "${HUGGING_FACE_ACCESS_TOKEN:-}" ]]; then
   export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-$HUGGING_FACE_ACCESS_TOKEN}"
 fi
 
-if [[ ! -x "$REPO_ROOT_DIR/.venv/bin/python" ]]; then
-  python -m venv "$REPO_ROOT_DIR/.venv"
-  # shellcheck disable=SC1091
-  source "$REPO_ROOT_DIR/.venv/bin/activate"
-  python -m pip install -U pip setuptools wheel
-  python -m pip install -r "$REPO_ROOT_DIR/requirements.txt" scikit-learn sentence-transformers huggingface_hub
-  python -m pip install -e "$REPO_ROOT_DIR"
-else
-  # shellcheck disable=SC1091
-  source "$REPO_ROOT_DIR/.venv/bin/activate"
-fi
+"$REPO_ROOT_DIR/scripts/bootstrap_env.sh"
+
+# shellcheck disable=SC1091
+source "$REPO_ROOT_DIR/.venv/bin/activate"
 
 if [[ "${PREPARE_EXPERIMENT_DATA:-0}" == "1" ]]; then
   python "$REPO_ROOT_DIR/scripts/prepare_experiment_data.py"

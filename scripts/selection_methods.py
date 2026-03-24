@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import errno
 import gc
+import os
 import random
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping
@@ -25,6 +28,7 @@ from llmtuner.extras.template import get_template_and_fix_tokenizer
 SelectorFn = Callable[["SelectionContext"], "SelectionResult"]
 SELECTORS: Dict[str, SelectorFn] = {}
 MEAN_KL_SELECTOR_NAME = "mean_kl"
+UNCERTAINTY_BAND_SELECTOR_NAME = "uncertainty_band"
 
 
 @dataclass(frozen=True)
@@ -68,7 +72,25 @@ class PooledCandidate:
 @dataclass(frozen=True)
 class ScoredCandidate:
     candidate: PooledCandidate
-    mean_kl: float
+    score: float
+    mean_kl: float | None = None
+    mean_entropy: float | None = None
+
+
+@dataclass(frozen=True)
+class CandidateEntropy:
+    candidate: PooledCandidate
+    mean_entropy: float
+
+
+@dataclass(frozen=True)
+class UncertaintyBandScoringResult:
+    scored_candidates: List[ScoredCandidate]
+    entropy_min: float | None
+    entropy_max: float | None
+    band_min_entropy: float | None
+    band_max_entropy: float | None
+    band_by_source_task: Mapping[str, Dict[str, float]]
 
 
 def register_selector(name: str) -> Callable[[SelectorFn], SelectorFn]:
@@ -92,6 +114,42 @@ def write_jsonl(path: Path, rows: List[Dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(path, "w") as writer:
         writer.write_all(rows)
+
+
+def is_stale_file_handle_error(exc: BaseException) -> bool:
+    if isinstance(exc, OSError) and exc.errno == errno.ESTALE:
+        return True
+    return "Stale file handle" in str(exc)
+
+
+def safe_hf_cache_dir() -> str:
+    return os.environ.get(
+        "SMART_SSR_HF_CACHE",
+        os.path.join(tempfile.gettempdir(), "smart-ssr-hf-cache"),
+    )
+
+
+def ensure_safe_hf_cache_dir() -> str:
+    cache_dir = safe_hf_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def from_pretrained_with_safe_hf_cache(factory, model_name_or_path: str, **kwargs):
+    cache_dir = ensure_safe_hf_cache_dir()
+    kwargs.setdefault("cache_dir", cache_dir)
+
+    try:
+        return factory.from_pretrained(model_name_or_path, **kwargs)
+    except OSError as exc:
+        if not is_stale_file_handle_error(exc):
+            raise
+
+        raise RuntimeError(
+            "Hugging Face download failed with a stale file handle while writing to "
+            f"cache directory {cache_dir!r}. Set SMART_SSR_HF_CACHE to a stable local "
+            "path such as /tmp/smart-ssr-hf-cache and rerun."
+        ) from exc
 
 
 def get_model_dtype() -> torch.dtype:
@@ -233,6 +291,76 @@ def mean_distribution_shift(
     return mean_kl
 
 
+@torch.inference_mode()
+def mean_predictive_entropy(
+    model,
+    input_ids: torch.Tensor,
+    target_mask: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    logits = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    ).logits[:, :-1, :]
+
+    log_p = F.log_softmax(logits, dim=-1, dtype=torch.float32)
+    p = log_p.exp()
+    entropy_per_pos = -(p * log_p).sum(dim=-1)
+
+    valid_mask = target_mask[:, 1:].to(entropy_per_pos.dtype)
+    if attention_mask is not None:
+        valid_mask = valid_mask * attention_mask[:, 1:].to(entropy_per_pos.dtype)
+
+    denom = valid_mask.sum(dim=-1).clamp_min(1.0)
+    mean_entropy = (entropy_per_pos * valid_mask).sum(dim=-1) / denom
+    return mean_entropy
+
+
+def validate_percentage(name: str, value: float) -> float:
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0.0 and 1.0.")
+    return value
+
+
+def resolve_entropy_band_bounds(
+    mean_entropies: List[float] | np.ndarray | torch.Tensor,
+    h_min: float,
+    h_max: float,
+) -> tuple[float, float]:
+    h_min = validate_percentage("h_min", h_min)
+    h_max = validate_percentage("h_max", h_max)
+    if h_min > h_max:
+        raise ValueError("h_min must be less than or equal to h_max.")
+
+    if isinstance(mean_entropies, torch.Tensor):
+        entropies = mean_entropies.detach().cpu().numpy().astype(np.float64, copy=False)
+    else:
+        entropies = np.asarray(mean_entropies, dtype=np.float64)
+
+    if entropies.size == 0:
+        raise ValueError("At least one mean entropy value is required.")
+
+    return (
+        float(np.quantile(entropies, h_min)),
+        float(np.quantile(entropies, h_max)),
+    )
+
+
+def uncertainty_band_score(
+    mean_entropy: torch.Tensor,
+    H_min: float,
+    H_max: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    H_mid = 0.5 * (H_min + H_max)
+    half_width = 0.5 * (H_max - H_min)
+
+    inside = (mean_entropy >= H_min) & (mean_entropy <= H_max)
+    score_inside = 1.0 - torch.abs(mean_entropy - H_mid) / (half_width + eps)
+    score = torch.where(inside, score_inside, torch.zeros_like(mean_entropy))
+    return torch.clamp(score, min=0.0, max=1.0)
+
+
 def score_pooled_candidates_by_mean_kl(
     model_name_or_path: str,
     current_checkpoint: Path,
@@ -249,10 +377,11 @@ def score_pooled_candidates_by_mean_kl(
     if not current_checkpoint.exists():
         raise FileNotFoundError(f"Current checkpoint does not exist: {current_checkpoint}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    tokenizer = from_pretrained_with_safe_hf_cache(AutoTokenizer, model_name_or_path)
     template = get_template_and_fix_tokenizer(template_name, tokenizer)
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model = from_pretrained_with_safe_hf_cache(
+        AutoModelForCausalLM,
         model_name_or_path,
         torch_dtype=get_model_dtype(),
         device_map="auto" if torch.cuda.is_available() else None,
@@ -310,6 +439,7 @@ def score_pooled_candidates_by_mean_kl(
                     scored_candidates.append(
                         ScoredCandidate(
                             candidate=candidate,
+                            score=float(score),
                             mean_kl=float(score),
                         )
                     )
@@ -321,7 +451,170 @@ def score_pooled_candidates_by_mean_kl(
         del model
         cleanup_cuda_memory()
 
-    return sorted(scored_candidates, key=lambda candidate: candidate.mean_kl, reverse=True)
+    return sorted(scored_candidates, key=lambda candidate: candidate.score, reverse=True)
+
+
+def score_pooled_candidates_by_uncertainty_band(
+    model_name_or_path: str,
+    current_checkpoint: Path,
+    pooled_candidates: List[PooledCandidate],
+    template_name: str,
+    max_source_length: int,
+    max_target_length: int,
+    selection_mode: str,
+    h_min: float,
+    h_max: float,
+    batch_size: int = 1,
+) -> UncertaintyBandScoringResult:
+    if batch_size <= 0:
+        raise ValueError("Uncertainty batch size must be positive.")
+    if not pooled_candidates:
+        return UncertaintyBandScoringResult(
+            scored_candidates=[],
+            entropy_min=None,
+            entropy_max=None,
+            band_min_entropy=None,
+            band_max_entropy=None,
+            band_by_source_task={},
+        )
+    if not current_checkpoint.exists():
+        raise FileNotFoundError(f"Current checkpoint does not exist: {current_checkpoint}")
+
+    tokenizer = from_pretrained_with_safe_hf_cache(AutoTokenizer, model_name_or_path)
+    template = get_template_and_fix_tokenizer(template_name, tokenizer)
+
+    model = from_pretrained_with_safe_hf_cache(
+        AutoModelForCausalLM,
+        model_name_or_path,
+        torch_dtype=get_model_dtype(),
+        device_map="auto" if torch.cuda.is_available() else None,
+        low_cpu_mem_usage=True,
+    )
+    model = PeftModelForCausalLM.from_pretrained(
+        model,
+        str(current_checkpoint),
+        adapter_name="current",
+        is_trainable=False,
+    )
+    if hasattr(model, "set_adapter"):
+        model.set_adapter("current")
+    model.eval()
+
+    device = model_input_device(model)
+    candidate_entropies: List[CandidateEntropy] = []
+
+    try:
+        for start in range(0, len(pooled_candidates), batch_size):
+            batch_candidates = pooled_candidates[start:start + batch_size]
+            input_ids, target_mask, attention_mask = build_scoring_batch(
+                rows=[candidate.row for candidate in batch_candidates],
+                tokenizer=tokenizer,
+                template=template,
+                max_source_length=max_source_length,
+                max_target_length=max_target_length,
+                device=device,
+            )
+            batch_entropies = mean_predictive_entropy(
+                model=model,
+                input_ids=input_ids,
+                target_mask=target_mask,
+                attention_mask=attention_mask,
+            )
+            for candidate, mean_entropy in zip(batch_candidates, batch_entropies.tolist()):
+                candidate_entropies.append(
+                    CandidateEntropy(
+                        candidate=candidate,
+                        mean_entropy=float(mean_entropy),
+                    )
+                )
+
+            del input_ids, target_mask, attention_mask, batch_entropies
+
+        cleanup_cuda_memory()
+    finally:
+        del model
+        cleanup_cuda_memory()
+
+    entropies_by_task: Dict[str, List[CandidateEntropy]] = {}
+    for candidate_entropy in candidate_entropies:
+        entropies_by_task.setdefault(candidate_entropy.candidate.source_task, []).append(candidate_entropy)
+
+    all_mean_entropies = [candidate_entropy.mean_entropy for candidate_entropy in candidate_entropies]
+    entropy_min = min(all_mean_entropies)
+    entropy_max = max(all_mean_entropies)
+    scored_candidates: List[ScoredCandidate] = []
+    band_by_source_task: Dict[str, Dict[str, float]] = {}
+    band_min_entropy: float | None = None
+    band_max_entropy: float | None = None
+
+    if selection_mode == "global":
+        band_min_entropy, band_max_entropy = resolve_entropy_band_bounds(
+            all_mean_entropies,
+            h_min=h_min,
+            h_max=h_max,
+        )
+        all_scores = uncertainty_band_score(
+            torch.tensor(all_mean_entropies, dtype=torch.float32),
+            H_min=band_min_entropy,
+            H_max=band_max_entropy,
+        ).tolist()
+        for candidate_entropy, score in zip(candidate_entropies, all_scores):
+            scored_candidates.append(
+                ScoredCandidate(
+                    candidate=candidate_entropy.candidate,
+                    score=float(score),
+                    mean_entropy=candidate_entropy.mean_entropy,
+                )
+            )
+        for source_task, task_candidate_entropies in entropies_by_task.items():
+            task_mean_entropies = [item.mean_entropy for item in task_candidate_entropies]
+            band_by_source_task[source_task] = {
+                "entropy_min": min(task_mean_entropies),
+                "entropy_max": max(task_mean_entropies),
+                "band_min_entropy": band_min_entropy,
+                "band_max_entropy": band_max_entropy,
+            }
+    elif selection_mode == "per_task_top_ratio":
+        for source_task, task_candidate_entropies in entropies_by_task.items():
+            task_mean_entropies = [item.mean_entropy for item in task_candidate_entropies]
+            task_band_min_entropy, task_band_max_entropy = resolve_entropy_band_bounds(
+                task_mean_entropies,
+                h_min=h_min,
+                h_max=h_max,
+            )
+            task_scores = uncertainty_band_score(
+                torch.tensor(task_mean_entropies, dtype=torch.float32),
+                H_min=task_band_min_entropy,
+                H_max=task_band_max_entropy,
+            ).tolist()
+            band_by_source_task[source_task] = {
+                "entropy_min": min(task_mean_entropies),
+                "entropy_max": max(task_mean_entropies),
+                "band_min_entropy": task_band_min_entropy,
+                "band_max_entropy": task_band_max_entropy,
+            }
+            for candidate_entropy, score in zip(task_candidate_entropies, task_scores):
+                scored_candidates.append(
+                    ScoredCandidate(
+                        candidate=candidate_entropy.candidate,
+                        score=float(score),
+                        mean_entropy=candidate_entropy.mean_entropy,
+                    )
+                )
+    else:
+        raise ValueError(
+            f"Unknown uncertainty selection mode `{selection_mode}`. "
+            "Available modes: global, per_task_top_ratio"
+        )
+
+    return UncertaintyBandScoringResult(
+        scored_candidates=sorted(scored_candidates, key=lambda candidate: candidate.score, reverse=True),
+        entropy_min=entropy_min,
+        entropy_max=entropy_max,
+        band_min_entropy=band_min_entropy,
+        band_max_entropy=band_max_entropy,
+        band_by_source_task=band_by_source_task,
+    )
 
 
 def pooled_embeddings(model_output) -> torch.Tensor:
@@ -331,8 +624,8 @@ def pooled_embeddings(model_output) -> torch.Tensor:
 
 
 def encode_texts(texts: List[str], model_name_or_path: str, batch_size: int = 32) -> np.ndarray:
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    model = AutoModel.from_pretrained(model_name_or_path)
+    tokenizer = from_pretrained_with_safe_hf_cache(AutoTokenizer, model_name_or_path)
+    model = from_pretrained_with_safe_hf_cache(AutoModel, model_name_or_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()

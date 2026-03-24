@@ -96,7 +96,7 @@ For this workspace, prefer the maintained wrapper instead of patching every hist
 
 The working wrapper already handles:
 - sourcing `keys.sh` if present
-- bootstrapping `.venv`
+- bootstrapping `.venv` through `scripts/bootstrap_env.sh`
 - training the 5-task queue `qa qg sa sum trans`
 - building synthetic rehearsal files for each completed task
 - evaluating each checkpoint on all tasks seen so far
@@ -105,6 +105,7 @@ Compatibility fixes already applied in this repo for the maintained path:
 - lazy imports in `src/llmtuner/__init__.py` so Python 3.12 can train without importing the old FastAPI stack
 - local JSON dataset loading fix in `src/llmtuner/dsets/loader.py`
 - `accelerate<1.0.0` pin in `requirements.txt` for compatibility with `transformers==4.36.0`
+- CUDA 12.1 torch bootstrap in `scripts/bootstrap_env.sh` so this workspace uses a driver-compatible GPU build
 
 ## 4) Environment setup
 
@@ -182,6 +183,21 @@ python scripts/run_paper_ssr_5task.py \
   --cuda 0
 ```
 
+The shortest paper-style command for this repo is now:
+
+```bash
+bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh
+```
+
+Use the same launcher with extra flags to change selector or resume:
+
+```bash
+bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh \
+  --selector mean_kl \
+  --candidate_source refined \
+  --skip_completed
+```
+
 Outputs:
 - checkpoints: `<output_root>/01_qa` ... `<output_root>/05_trans`
 - per-stage dataset registries and selected rehearsal files: `<output_root>/stage_data/<stage>/`
@@ -199,6 +215,7 @@ Built-in selectors exposed by the maintained runners:
 - `random`
 - `kmeans`
 - `mean_kl`
+- `uncertainty_band`
 
 Selector context includes:
 - source task and target task
@@ -236,6 +253,8 @@ Notes:
 - `--skip_train --skip_eval` materializes only the selected rehearsal subsets.
 - The replay runner uses an experiment-local `dataset_info.json` and does not modify `data/dataset_info.json`.
 - `mean_kl` supports `--mean_kl_selection_mode global` and `--mean_kl_selection_mode per_task_top_ratio`.
+- `uncertainty_band` supports `--uncertainty_selection_mode global` and `--uncertainty_selection_mode per_task_top_ratio`.
+- `--h_min` and `--h_max` are percentile cutoffs in `[0.0, 1.0]`, not raw entropy values. `0.25` / `0.75` means the middle 50% entropy band of the scored candidate set, or of each source task in `per_task_top_ratio` mode.
 - Use the replay path for fast selector iteration; the full paper-style runner now accepts `--selector` and writes stage-local training inputs under `<output_root>/stage_data/<stage>/`.
 - If you rerun the same paper-style `output_root` without `--skip_completed`, the runner refreshes `refined` and `final` for any retrained stage.
 

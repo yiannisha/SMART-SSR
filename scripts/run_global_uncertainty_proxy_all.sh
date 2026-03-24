@@ -13,6 +13,8 @@ CANDIDATE_SOURCE="${CANDIDATE_SOURCE:-refined}"
 SAMPLE_MEMORY="${SAMPLE_MEMORY:-200}"
 CUDA_DEVICE="${CUDA_DEVICE:-0}"
 SMART_SSR_HF_CACHE="${SMART_SSR_HF_CACHE:-/tmp/smart-ssr-hf-cache}"
+H_MIN="${H_MIN:-0.25}"
+H_MAX="${H_MAX:-0.75}"
 OUTPUT_ROOT_BASE="${OUTPUT_ROOT_BASE:-}"
 export SMART_SSR_HF_CACHE
 
@@ -20,7 +22,7 @@ TASKS=(qg sa sum trans)
 EXTRA_ARGS=("$@")
 
 for task in "${TASKS[@]}"; do
-  echo "=== Running global mean_kl proxy iteration for ${task} ==="
+  echo "=== Running global uncertainty_band proxy iteration for ${task} ==="
 
   cmd=(
     "${PYTHON_BIN}"
@@ -29,11 +31,13 @@ for task in "${TASKS[@]}"; do
     "--model_name_or_path" "${MODEL_NAME_OR_PATH}"
     "--template" "${TEMPLATE}"
     "--iteration_task" "${task}"
-    "--selector" "mean_kl"
-    "--mean_kl_selection_mode" "global"
+    "--selector" "uncertainty_band"
+    "--uncertainty_selection_mode" "global"
     "--candidate_source" "${CANDIDATE_SOURCE}"
     "--sample_memory" "${SAMPLE_MEMORY}"
     "--cuda" "${CUDA_DEVICE}"
+    "--h_min" "${H_MIN}"
+    "--h_max" "${H_MAX}"
   )
 
   if [[ -n "${OUTPUT_ROOT_BASE}" ]]; then
