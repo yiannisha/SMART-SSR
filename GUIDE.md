@@ -68,7 +68,7 @@ Pipeline in README and custom scripts:
    - Legacy KMeans selector: `custom/icl_gen/kmeans_self.py`
    - Replay/dev selector path: `scripts/selection_methods.py` plus `scripts/run_selection_proxy_iteration.py`
 
-The maintained paper-style runner still uses the fixed `refined -> kmeans -> cl_queue` path.
+The maintained paper-style runner shares only `raw` and `parsed` artifacts across runs. Checkpoint-dependent `refined` and compatibility `cl_queue` artifacts are run-local, so selector comparisons do not silently reuse another run's refined data.
 
 ### E. Additional evaluation workflows
 - CL eval in main scripts uses `--stage sftrp` and writes:
@@ -162,14 +162,43 @@ bash scripts/run_basic_ssr_5task.sh \
   --skip_completed
 ```
 
+### Paper-style full run with selector control
+
+Use `scripts/run_paper_ssr_5task.py` when you want the maintained artifact pipeline (`raw -> parsed -> refined`) plus selector-controlled rehearsal for training.
+
+Example full run for `llama2-7b-chat` with pooled KL selection:
+
+```bash
+cd /workspace/SMART-SSR
+source .venv/bin/activate
+source keys.sh
+
+python scripts/run_paper_ssr_5task.py \
+  --model_name_or_path meta-llama/Llama-2-7b-chat-hf \
+  --model_family llama2-7b-chat \
+  --selector mean_kl \
+  --candidate_source refined \
+  --output_root saves/paper-ssr-5task-llama2-7b-chat-mean-kl \
+  --cuda 0
+```
+
+Outputs:
+- checkpoints: `<output_root>/01_qa` ... `<output_root>/05_trans`
+- per-stage dataset registries and selected rehearsal files: `<output_root>/stage_data/<stage>/`
+- run-local checkpoint-dependent artifacts: `<output_root>/artifacts/refined/` and `<output_root>/artifacts/cl_queue/`
+- run summary: `<output_root>/run_summary.json`
+- aggregate metrics: `<output_root>/aggregate_metrics.json`
+- shared reusable generation artifacts: `data/ni-cus0.12/genearated-icl-naive/{model_family}/ori-van/*.json` and `data/ni-cus0.12/genearated-icl-naive-parsed-filtered/{model_family}/ori-van/*.json`
+
 ### Selector development / single-iteration replay
 
 Use `scripts/run_selection_proxy_iteration.py` when you already have a base SSR run with checkpoints, generated artifacts and `run_summary.json`, and you want to test a different selector on one intermediate stage without regenerating all data.
 
-Built-in selectors in `scripts/selection_methods.py`:
+Built-in selectors exposed by the maintained runners:
 - `head`
 - `random`
 - `kmeans`
+- `mean_kl`
 
 Selector context includes:
 - source task and target task
@@ -206,7 +235,9 @@ Notes:
 - `--candidate_source` accepts `raw`, `parsed`, `refined` or `final`.
 - `--skip_train --skip_eval` materializes only the selected rehearsal subsets.
 - The replay runner uses an experiment-local `dataset_info.json` and does not modify `data/dataset_info.json`.
-- Use this path for fast selector iteration; the maintained paper-style runner still uses the fixed `refined -> kmeans -> cl_queue` selection step.
+- `mean_kl` supports `--mean_kl_selection_mode global` and `--mean_kl_selection_mode per_task_top_ratio`.
+- Use the replay path for fast selector iteration; the full paper-style runner now accepts `--selector` and writes stage-local training inputs under `<output_root>/stage_data/<stage>/`.
+- If you rerun the same paper-style `output_root` without `--skip_completed`, the runner refreshes `refined` and `final` for any retrained stage.
 
 ## 6) Minimal way to run core CL experiments manually
 

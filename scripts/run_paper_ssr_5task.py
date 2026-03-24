@@ -1,10 +1,24 @@
 import argparse
+from collections import defaultdict
 import json
+import math
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Mapping
+
+from selection_methods import (
+    MEAN_KL_SELECTOR_NAME,
+    PooledCandidate,
+    SelectionContext,
+    list_methods,
+    load_jsonl,
+    normalize_candidate_rows,
+    score_pooled_candidates_by_mean_kl,
+    select_rows,
+    write_jsonl,
+)
 
 
 TASKS = ["qa", "qg", "sa", "sum", "trans"]
@@ -28,6 +42,30 @@ MODEL_SPECS = {
         "dataset_key": lambda task: f"ni_c012_icl_gen_km20_self_cl_queue_{task}",
     }
 }
+TRAIN_COLUMNS = {
+    "prompt": "full_prompt",
+    "query": "",
+    "response": "output",
+    "history": "",
+}
+REHEARSAL_COLUMNS = {
+    "prompt": "inputs",
+    "query": "",
+    "response": "targets",
+    "history": "",
+}
+ARTIFACT_KEY_MAP = {
+    "raw": "raw_generation_file",
+    "parsed": "parsed_generation_file",
+    "refined": "refined_generation_file",
+    "final": "rehearsal_file",
+}
+POOLED_SELECTORS = {MEAN_KL_SELECTOR_NAME}
+MEAN_KL_SELECTION_MODES = ("global", "per_task_top_ratio")
+
+
+def available_selectors() -> List[str]:
+    return sorted(set(list_methods()) | POOLED_SELECTORS)
 
 
 def repo_env(cuda: str) -> Dict[str, str]:
@@ -51,11 +89,12 @@ def checkpoint_dir(output_root: Path, task_index: int, task_name: str) -> Path:
     return output_root / f"{task_index + 1:02d}_{task_name}"
 
 
-def build_paths(model_tag: str, task_name: str) -> Dict[str, Path]:
+def build_paths(output_root: Path, model_tag: str, task_name: str) -> Dict[str, Path]:
     raw_root = Path(f"data/ni-cus0.12/genearated-icl-naive/{model_tag}/ori-van")
     parsed_root = Path(f"data/ni-cus0.12/genearated-icl-naive-parsed-filtered/{model_tag}/ori-van")
-    refined_root = Path(f"data/ni-cus0.12/genearated-icl-naive-kmeans20-self/{model_tag}/refined")
-    final_root = Path(f"data/ni-cus0.12/genearated-icl-naive-kmeans20-self/{model_tag}/cl_queue")
+    artifact_root = output_root / "artifacts"
+    refined_root = artifact_root / "refined"
+    final_root = artifact_root / "cl_queue"
     suffix = f"{task_name}.train.smp001.2shot.smp3.rp1.2.json"
     return {
         "raw": raw_root / suffix,
@@ -65,11 +104,128 @@ def build_paths(model_tag: str, task_name: str) -> Dict[str, Path]:
     }
 
 
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def resolve_candidate_source(selector: str, candidate_source: str | None) -> str:
+    if candidate_source is not None:
+        return candidate_source
+    if selector == "kmeans":
+        return "final"
+    return "refined"
+
+
+def make_dataset_entry(file_name: str, columns: Dict[str, str]) -> Dict[str, object]:
+    return {
+        "file_name": file_name,
+        "columns": columns,
+    }
+
+
+def write_dataset_registry(
+    dataset_dir: Path,
+    tasks: List[str],
+    rehearsal_files: Mapping[str, Path],
+) -> Dict[str, str]:
+    split_root = (repo_root() / "data" / "ni-cus0.12" / "split").resolve()
+    dataset_info: Dict[str, Dict[str, object]] = {}
+    rehearsal_keys: Dict[str, str] = {}
+
+    for task_name in tasks:
+        dataset_info[f"ni_c012_{task_name}_train"] = make_dataset_entry(
+            str((split_root / f"{task_name}.train.json").resolve()),
+            TRAIN_COLUMNS,
+        )
+        dataset_info[f"ni_c012_{task_name}_eval"] = make_dataset_entry(
+            str((split_root / f"{task_name}.eval.json").resolve()),
+            TRAIN_COLUMNS,
+        )
+
+    for source_task, rehearsal_path in rehearsal_files.items():
+        dataset_key = f"stage_rehearsal_{source_task}"
+        rehearsal_keys[source_task] = dataset_key
+        dataset_info[dataset_key] = make_dataset_entry(
+            str(rehearsal_path.resolve()),
+            REHEARSAL_COLUMNS,
+        )
+
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    (dataset_dir / "dataset_info.json").write_text(json.dumps(dataset_info, indent=2))
+    return rehearsal_keys
+
+
+def resolve_global_selection_budget(
+    num_candidates: int,
+    num_previous_tasks: int,
+    sample_memory: int,
+    global_selection_count: int | None,
+    global_selection_ratio: float | None,
+) -> int:
+    if global_selection_count is not None and global_selection_ratio is not None:
+        raise ValueError(
+            "Specify at most one of --global_selection_count or --global_selection_ratio."
+        )
+
+    if global_selection_ratio is not None:
+        if not 0.0 <= global_selection_ratio <= 1.0:
+            raise ValueError("--global_selection_ratio must be between 0.0 and 1.0.")
+        budget = math.ceil(num_candidates * global_selection_ratio)
+    elif global_selection_count is not None:
+        if global_selection_count < 0:
+            raise ValueError("--global_selection_count must be non-negative.")
+        budget = global_selection_count
+    else:
+        budget = sample_memory * num_previous_tasks
+
+    return min(num_candidates, budget)
+
+
+def validate_selection_ratio(name: str, ratio: float | None) -> float:
+    if ratio is None:
+        raise ValueError(f"{name} must be provided.")
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"{name} must be between 0.0 and 1.0.")
+    return ratio
+
+
+def resolve_per_task_selection_budgets(
+    candidate_counts: Mapping[str, int],
+    selection_ratio: float,
+) -> Dict[str, int]:
+    return {
+        source_task: min(count, math.ceil(count * selection_ratio))
+        for source_task, count in candidate_counts.items()
+    }
+
+
+def stage_data_dir(output_root: Path, task_index: int, task_name: str) -> Path:
+    return output_root / "stage_data" / f"{task_index + 1:02d}_{task_name}"
+
+
+def stage_selection_dir(output_root: Path, task_index: int, task_name: str) -> Path:
+    return stage_data_dir(output_root, task_index, task_name) / "rehearsal"
+
+
+def stage_score_path(
+    output_root: Path,
+    task_index: int,
+    task_name: str,
+    selector: str,
+    candidate_source: str,
+) -> Path:
+    return (
+        stage_data_dir(output_root, task_index, task_name)
+        / f"{selector}_scores.{candidate_source}.jsonl"
+    )
+
+
 def run_single_task_train(
     python_bin: str,
     env: Dict[str, str],
     model_name_or_path: str,
     template: str,
+    dataset_dir: Path,
     task_name: str,
     output_dir: Path,
     max_source_length: int,
@@ -89,7 +245,7 @@ def run_single_task_train(
         "--overwrite_output_dir", "True",
         "--finetuning_type", "lora",
         "--template", template,
-        "--dataset_dir", "data",
+        "--dataset_dir", str(dataset_dir),
         "--dataset", f"ni_c012_{task_name}_train",
         "--max_source_length", str(max_source_length),
         "--max_target_length", str(max_target_length),
@@ -119,6 +275,7 @@ def run_cl_train(
     env: Dict[str, str],
     model_name_or_path: str,
     template: str,
+    dataset_dir: Path,
     datasets: List[str],
     checkpoint: Path,
     output_dir: Path,
@@ -140,7 +297,7 @@ def run_cl_train(
         "--overwrite_output_dir", "True",
         "--finetuning_type", "lora",
         "--template", template,
-        "--dataset_dir", "data",
+        "--dataset_dir", str(dataset_dir),
         "--dataset", ",".join(datasets),
         "--max_source_length", str(max_source_length),
         "--max_target_length", str(max_target_length),
@@ -170,6 +327,7 @@ def run_eval(
     env: Dict[str, str],
     model_name_or_path: str,
     template: str,
+    dataset_dir: Path,
     checkpoint_dir_path: Path,
     eval_task: str,
     max_source_length: int,
@@ -187,7 +345,7 @@ def run_eval(
         "--predict_with_generate", "True",
         "--finetuning_type", "lora",
         "--template", template,
-        "--dataset_dir", "data",
+        "--dataset_dir", str(dataset_dir),
         "--dataset", f"ni_c012_{eval_task}_eval",
         "--max_source_length", str(max_source_length),
         "--max_target_length", str(max_target_length),
@@ -254,6 +412,8 @@ def run_kmeans_selection(
     output_path: Path,
     sample_memory: int
 ) -> None:
+    if output_path.exists():
+        output_path.unlink()
     command = [
         python_bin,
         "custom/icl_gen/select_kmeans_examples.py",
@@ -289,6 +449,267 @@ def run_refinement(
         "--template", template
     ]
     run_command(command, env)
+
+
+def select_stage_rehearsal_files(
+    output_root: Path,
+    spec: Dict[str, object],
+    tasks: List[str],
+    target_index: int,
+    target_task: str,
+    selector: str,
+    candidate_source: str,
+    model_name_or_path: str,
+    template: str,
+    sample_memory: int,
+    seed: int,
+    encoder_model_name_or_path: str,
+    global_selection_count: int | None,
+    global_selection_ratio: float | None,
+    mean_kl_selection_mode: str,
+    per_task_selection_ratio: float | None,
+    max_source_length: int,
+    max_target_length: int,
+    kl_batch_size: int,
+) -> tuple[Dict[str, Path], Dict[str, Dict[str, object]], Dict[str, object] | None]:
+    previous_tasks = tasks[:target_index]
+    if not previous_tasks:
+        return {}, {}, None
+
+    history_checkpoints = [
+        checkpoint_dir(output_root, idx, task_name).resolve()
+        for idx, task_name in enumerate(previous_tasks)
+    ]
+    previous_checkpoint = history_checkpoints[-1]
+    selection_dir = stage_selection_dir(output_root, target_index, target_task)
+    selection_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = stage_data_dir(output_root, target_index, target_task)
+
+    if selector in POOLED_SELECTORS:
+        pooled_candidates: List[PooledCandidate] = []
+        candidate_paths: Dict[str, Path] = {}
+        candidate_counts: Dict[str, int] = {}
+
+        for source_task in previous_tasks:
+            source_task_index = tasks.index(source_task)
+            source_paths = build_paths(output_root, spec["model_tag"], source_task)
+            candidate_path = source_paths[candidate_source]
+            if not candidate_path.exists():
+                raise FileNotFoundError(
+                    f"Candidate artifact does not exist for task `{source_task}`: {candidate_path}"
+                )
+            candidate_raw_rows = load_jsonl(candidate_path)
+            candidate_rows = normalize_candidate_rows(candidate_raw_rows)
+            candidate_paths[source_task] = candidate_path
+            candidate_counts[source_task] = len(candidate_rows)
+
+            for candidate_index, (row, raw_row) in enumerate(zip(candidate_rows, candidate_raw_rows)):
+                pooled_candidates.append(
+                    PooledCandidate(
+                        source_task=source_task,
+                        source_task_index=source_task_index,
+                        source_checkpoint=checkpoint_dir(
+                            output_root,
+                            source_task_index,
+                            source_task,
+                        ).resolve(),
+                        candidate_index=candidate_index,
+                        row=row,
+                        raw_row=raw_row,
+                    )
+                )
+
+        selection_ratio_applied: float | None = None
+        per_task_budgets: Dict[str, int] | None = None
+        if mean_kl_selection_mode == "global":
+            budget = resolve_global_selection_budget(
+                num_candidates=len(pooled_candidates),
+                num_previous_tasks=len(previous_tasks),
+                sample_memory=sample_memory,
+                global_selection_count=global_selection_count,
+                global_selection_ratio=global_selection_ratio,
+            )
+        elif mean_kl_selection_mode == "per_task_top_ratio":
+            if global_selection_count is not None or global_selection_ratio is not None:
+                raise ValueError(
+                    "--global_selection_count/--global_selection_ratio cannot be used with "
+                    "--mean_kl_selection_mode per_task_top_ratio."
+                )
+            selection_ratio_applied = validate_selection_ratio(
+                "--per_task_selection_ratio",
+                per_task_selection_ratio,
+            )
+            per_task_budgets = resolve_per_task_selection_budgets(
+                candidate_counts=candidate_counts,
+                selection_ratio=selection_ratio_applied,
+            )
+            budget = sum(per_task_budgets.values())
+        else:
+            raise ValueError(
+                f"Unknown mean KL selection mode `{mean_kl_selection_mode}`. "
+                f"Available modes: {', '.join(MEAN_KL_SELECTION_MODES)}"
+            )
+
+        scored_candidates = score_pooled_candidates_by_mean_kl(
+            model_name_or_path=model_name_or_path,
+            current_checkpoint=previous_checkpoint,
+            pooled_candidates=pooled_candidates,
+            template_name=template,
+            max_source_length=max_source_length,
+            max_target_length=max_target_length,
+            batch_size=kl_batch_size,
+        )
+
+        ranked_score_path = stage_score_path(
+            output_root,
+            target_index,
+            target_task,
+            selector,
+            candidate_source,
+        )
+        ranked_rows: List[Dict[str, object]] = []
+        all_scores_by_task: Dict[str, List[float]] = defaultdict(list)
+        selected_scores_by_task: Dict[str, List[float]] = defaultdict(list)
+        selected_rows_by_task: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+        selected_counts_by_task: Dict[str, int] = defaultdict(int)
+
+        for rank, scored_candidate in enumerate(scored_candidates, start=1):
+            candidate = scored_candidate.candidate
+            score = scored_candidate.mean_kl
+            all_scores_by_task[candidate.source_task].append(score)
+            ranked_rows.append(
+                {
+                    "rank": rank,
+                    "source_task": candidate.source_task,
+                    "source_task_index": candidate.source_task_index,
+                    "source_checkpoint": str(candidate.source_checkpoint),
+                    "candidate_index": candidate.candidate_index,
+                    "mean_kl": score,
+                    "inputs": candidate.row["inputs"],
+                    "targets": candidate.row["targets"],
+                }
+            )
+
+            should_select = False
+            if mean_kl_selection_mode == "global":
+                should_select = rank <= budget
+            else:
+                assert per_task_budgets is not None
+                should_select = (
+                    selected_counts_by_task[candidate.source_task]
+                    < per_task_budgets[candidate.source_task]
+                )
+
+            if should_select:
+                selected_rows_by_task[candidate.source_task].append(candidate.row)
+                selected_scores_by_task[candidate.source_task].append(score)
+                selected_counts_by_task[candidate.source_task] += 1
+
+        write_jsonl(ranked_score_path, ranked_rows)
+
+        rehearsal_files: Dict[str, Path] = {}
+        selection_metadata: Dict[str, Dict[str, object]] = {}
+        for source_task in previous_tasks:
+            selected_rows = selected_rows_by_task.get(source_task, [])
+            selected_path: str | None = None
+            if selected_rows:
+                selection_path = selection_dir / f"{source_task}.{selector}.{candidate_source}.jsonl"
+                write_jsonl(selection_path, selected_rows)
+                rehearsal_files[source_task] = selection_path
+                selected_path = str(selection_path)
+
+            source_scores = all_scores_by_task.get(source_task, [])
+            chosen_scores = selected_scores_by_task.get(source_task, [])
+            selection_metadata[source_task] = {
+                "candidate_path": str(candidate_paths[source_task]),
+                "selected_path": selected_path,
+                "candidate_source": candidate_source,
+                "history_checkpoints": [str(path) for path in history_checkpoints],
+                "selector": selector,
+                "mean_kl_selection_mode": mean_kl_selection_mode,
+                "current_checkpoint": str(previous_checkpoint),
+                "num_candidates": candidate_counts[source_task],
+                "selected_count": len(selected_rows),
+                "selection_ratio": selection_ratio_applied,
+                "selection_budget": (
+                    None
+                    if per_task_budgets is None
+                    else per_task_budgets[source_task]
+                ),
+                "mean_kl_min": min(source_scores) if source_scores else None,
+                "mean_kl_max": max(source_scores) if source_scores else None,
+                "selected_mean_kl_min": min(chosen_scores) if chosen_scores else None,
+                "selected_mean_kl_max": max(chosen_scores) if chosen_scores else None,
+            }
+
+        selection_pool_metadata = {
+            "selector": selector,
+            "candidate_source": candidate_source,
+            "mean_kl_selection_mode": mean_kl_selection_mode,
+            "current_checkpoint": str(previous_checkpoint),
+            "num_candidates_total": len(pooled_candidates),
+            "selected_count_total": budget,
+            "default_total_budget": sample_memory * len(previous_tasks),
+            "global_selection_count": global_selection_count,
+            "global_selection_ratio": global_selection_ratio,
+            "per_task_selection_ratio": selection_ratio_applied,
+            "per_task_selection_budgets": per_task_budgets,
+            "kl_batch_size": kl_batch_size,
+            "score_path": str(ranked_score_path),
+        }
+        return rehearsal_files, selection_metadata, selection_pool_metadata
+
+    rehearsal_files = {}
+    selection_metadata = {}
+    for source_task in previous_tasks:
+        source_task_index = tasks.index(source_task)
+        source_paths = build_paths(output_root, spec["model_tag"], source_task)
+        candidate_path = source_paths[candidate_source]
+        if not candidate_path.exists():
+            raise FileNotFoundError(
+                f"Candidate artifact does not exist for task `{source_task}`: {candidate_path}"
+            )
+
+        candidate_raw_rows = load_jsonl(candidate_path)
+        candidate_rows = normalize_candidate_rows(candidate_raw_rows)
+        selection_path = selection_dir / f"{source_task}.{selector}.{candidate_source}.jsonl"
+        context = SelectionContext(
+            method_name=selector,
+            source_task=source_task,
+            source_task_index=source_task_index,
+            source_checkpoint=checkpoint_dir(output_root, source_task_index, source_task).resolve(),
+            target_task=target_task,
+            target_index=target_index,
+            sample_memory=sample_memory,
+            seed=seed,
+            encoder_model_name_or_path=encoder_model_name_or_path,
+            base_run_dir=output_root,
+            candidate_source_name=candidate_source,
+            candidate_path=candidate_path,
+            candidate_rows=candidate_rows,
+            candidate_raw_rows=candidate_raw_rows,
+            source_paths=source_paths,
+            history_tasks=list(previous_tasks),
+            history_checkpoints=list(history_checkpoints),
+            work_dir=work_dir,
+        )
+        result = select_rows(selector, context)
+
+        selected_path: str | None = None
+        if result.rows:
+            write_jsonl(selection_path, result.rows)
+            rehearsal_files[source_task] = selection_path
+            selected_path = str(selection_path)
+
+        selection_metadata[source_task] = {
+            "candidate_path": str(candidate_path),
+            "selected_path": selected_path,
+            "candidate_source": candidate_source,
+            "history_checkpoints": [str(path) for path in history_checkpoints],
+            **result.metadata,
+        }
+
+    return rehearsal_files, selection_metadata, None
 
 
 def load_rouge_l(path: Path) -> float:
@@ -338,7 +759,23 @@ def main() -> None:
     parser.add_argument("--output_root", default="saves/paper-ssr-5task")
     parser.add_argument("--tasks", nargs="+", default=TASKS)
     parser.add_argument("--cuda", default="0")
+    parser.add_argument("--selector", choices=available_selectors(), default="kmeans")
+    parser.add_argument("--candidate_source", choices=sorted(ARTIFACT_KEY_MAP), default=None)
+    parser.add_argument(
+        "--encoder_model_name_or_path",
+        default="princeton-nlp/sup-simcse-roberta-base",
+    )
     parser.add_argument("--sample_memory", type=int, default=200)
+    parser.add_argument("--global_selection_count", type=int)
+    parser.add_argument("--global_selection_ratio", type=float)
+    parser.add_argument(
+        "--mean_kl_selection_mode",
+        choices=MEAN_KL_SELECTION_MODES,
+        default="global",
+    )
+    parser.add_argument("--per_task_selection_ratio", type=float)
+    parser.add_argument("--kl_batch_size", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_source_length", type=int, default=1024)
     parser.add_argument("--max_target_length", type=int, default=512)
     parser.add_argument("--num_train_epochs", type=float, default=3.0)
@@ -354,11 +791,12 @@ def main() -> None:
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     spec = MODEL_SPECS[args.model_family]
+    candidate_source = resolve_candidate_source(args.selector, args.candidate_source)
 
-    summary: Dict[str, Dict[str, List[str]]] = {}
+    summary: Dict[str, Dict[str, object]] = {}
 
     for idx, task_name in enumerate(args.tasks):
-        paths = build_paths(spec["model_tag"], task_name)
+        paths = build_paths(output_root, spec["model_tag"], task_name)
         for path in paths.values():
             path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -383,14 +821,58 @@ def main() -> None:
 
         current_checkpoint = checkpoint_dir(output_root, idx, task_name)
         previous_checkpoint = checkpoint_dir(output_root, idx - 1, args.tasks[idx - 1]) if idx > 0 else None
+        current_stage_dataset_dir = stage_data_dir(output_root, idx, task_name)
+        should_train_stage = not args.skip_completed or not current_checkpoint.exists()
 
-        if not args.skip_completed or not current_checkpoint.exists():
+        rehearsal_files: Dict[str, Path] = {}
+        selection_metadata: Dict[str, Dict[str, object]] = {}
+        selection_pool_metadata: Dict[str, object] | None = None
+        if idx > 0:
+            rehearsal_files, selection_metadata, selection_pool_metadata = select_stage_rehearsal_files(
+                output_root=output_root,
+                spec=spec,
+                tasks=args.tasks,
+                target_index=idx,
+                target_task=task_name,
+                selector=args.selector,
+                candidate_source=candidate_source,
+                model_name_or_path=args.model_name_or_path,
+                template=spec["train_template"],
+                sample_memory=args.sample_memory,
+                seed=args.seed,
+                encoder_model_name_or_path=args.encoder_model_name_or_path,
+                global_selection_count=args.global_selection_count,
+                global_selection_ratio=args.global_selection_ratio,
+                mean_kl_selection_mode=args.mean_kl_selection_mode,
+                per_task_selection_ratio=args.per_task_selection_ratio,
+                max_source_length=args.max_source_length,
+                max_target_length=args.max_target_length,
+                kl_batch_size=args.kl_batch_size,
+            )
+        rehearsal_dataset_keys = write_dataset_registry(
+            current_stage_dataset_dir,
+            args.tasks,
+            rehearsal_files,
+        )
+        selected_source_tasks = [
+            source_task
+            for source_task in args.tasks[:idx]
+            if source_task in rehearsal_dataset_keys
+        ]
+        train_datasets = [f"ni_c012_{task_name}_train"]
+        train_datasets.extend(
+            rehearsal_dataset_keys[source_task]
+            for source_task in selected_source_tasks
+        )
+
+        if should_train_stage:
             if idx == 0:
                 run_single_task_train(
                     python_bin=python_bin,
                     env=env,
                     model_name_or_path=args.model_name_or_path,
                     template=spec["train_template"],
+                    dataset_dir=current_stage_dataset_dir,
                     task_name=task_name,
                     output_dir=current_checkpoint,
                     max_source_length=args.max_source_length,
@@ -401,14 +883,13 @@ def main() -> None:
                     gradient_accumulation_steps=args.gradient_accumulation_steps
                 )
             else:
-                datasets = [f"ni_c012_{task_name}_train"]
-                datasets.extend(spec["dataset_key"](prev_task) for prev_task in args.tasks[:idx])
                 run_cl_train(
                     python_bin=python_bin,
                     env=env,
                     model_name_or_path=args.model_name_or_path,
                     template=spec["train_template"],
-                    datasets=datasets,
+                    dataset_dir=current_stage_dataset_dir,
+                    datasets=train_datasets,
                     checkpoint=previous_checkpoint,
                     output_dir=current_checkpoint,
                     max_source_length=args.max_source_length,
@@ -419,7 +900,7 @@ def main() -> None:
                         gradient_accumulation_steps=args.gradient_accumulation_steps
                     )
 
-        if not paths["refined"].exists():
+        if should_train_stage or not paths["refined"].exists():
             run_refinement(
                 python_bin=python_bin,
                 env=env,
@@ -430,7 +911,7 @@ def main() -> None:
                 output_path=paths["refined"]
             )
 
-        if not paths["final"].exists():
+        if should_train_stage or not paths["final"].exists():
             run_kmeans_selection(
                 python_bin=python_bin,
                 env=env,
@@ -446,6 +927,7 @@ def main() -> None:
                 env=env,
                 model_name_or_path=args.model_name_or_path,
                 template=spec["train_template"],
+                dataset_dir=current_stage_dataset_dir,
                 checkpoint_dir_path=current_checkpoint,
                 eval_task=eval_task,
                 max_source_length=args.max_source_length,
@@ -455,11 +937,24 @@ def main() -> None:
 
         summary[task_name] = {
             "checkpoint_dir": [str(current_checkpoint)],
+            "stage_dataset_dir": [str(current_stage_dataset_dir)],
             "raw_generation_file": [str(paths["raw"])],
             "parsed_generation_file": [str(paths["parsed"])],
             "refined_generation_file": [str(paths["refined"])],
             "kmeans_selection_file": [str(paths["final"])],
             "rehearsal_file": [str(paths["final"])],
+            "selector": args.selector,
+            "candidate_source": candidate_source,
+            "artifact_scope": {
+                "raw": "shared_model_family",
+                "parsed": "shared_model_family",
+                "refined": "run_local",
+                "final": "run_local",
+            },
+            "selection_pool": selection_pool_metadata,
+            "selection": selection_metadata,
+            "train_datasets": train_datasets,
+            "selected_source_tasks": selected_source_tasks,
             "evaluated_tasks": eval_tasks
         }
 

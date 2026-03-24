@@ -51,7 +51,7 @@ This repository now includes maintained runners for the main SSR workflows in th
 - Python driver: `scripts/run_basic_ssr_5task.py`
 - paper-style artifact pipeline: `scripts/run_paper_ssr_5task.py`
 - synthetic rehearsal builder: `custom/icl_gen/build_ssr_dataset.py`
-- selector registry for replay experiments: `scripts/selection_methods.py`
+- selector registry and scoring helpers: `scripts/selection_methods.py`
 - single-iteration selector replay: `scripts/run_selection_proxy_iteration.py`
 
 Example:
@@ -86,11 +86,12 @@ For fast selection-method iteration, use `scripts/run_selection_proxy_iteration.
 - generated artifacts (`raw`, `parsed`, `refined`, `final`)
 - `run_summary.json`
 
-Built-in selectors live in `scripts/selection_methods.py`:
+Built-in selectors exposed by the maintained runners:
 
 - `head`
 - `random`
 - `kmeans`
+- `mean_kl`
 
 Each selector receives a `SelectionContext` with:
 
@@ -117,6 +118,20 @@ python scripts/run_selection_proxy_iteration.py \
   --eval_max_samples 50
 ```
 
+Full paper-style run with `mean_kl`:
+
+```bash
+source .venv/bin/activate
+
+python scripts/run_paper_ssr_5task.py \
+  --model_name_or_path meta-llama/Llama-2-7b-chat-hf \
+  --model_family llama2-7b-chat \
+  --selector mean_kl \
+  --candidate_source refined \
+  --output_root saves/paper-ssr-5task-llama2-7b-chat-mean-kl \
+  --cuda 0
+```
+
 Replay outputs:
 
 - selected rehearsal files under `<output_root>/proxy_data/rehearsal/`
@@ -130,7 +145,10 @@ Notes:
 - `--candidate_source` can be `raw`, `parsed`, `refined` or `final`.
 - `--skip_train --skip_eval` builds only the selected rehearsal subsets.
 - The replay runner does not modify `data/dataset_info.json`.
-- The maintained paper-style runner still uses the fixed `refined -> kmeans -> cl_queue` path. Use the replay runner to test new selectors before wiring them into the full end-to-end pipeline.
+- `mean_kl` supports `--mean_kl_selection_mode global` and `--mean_kl_selection_mode per_task_top_ratio`.
+- The maintained paper-style runner now accepts `--selector` and writes stage-local dataset registries under `<output_root>/stage_data/<stage>/dataset_info.json`.
+- The paper-style runner shares only `raw` and `parsed` artifacts across runs. Checkpoint-dependent `refined` and compatibility `final/cl_queue` artifacts are written under `<output_root>/artifacts/`.
+- If you rerun the same `output_root` without `--skip_completed`, the runner refreshes `refined` and `final` for any retrained stage.
 
 ## 🛢 Pipeline
 
@@ -148,7 +166,7 @@ Notes:
 1. legacy selection scripts are still available in `custom/icl_gen/random_select.py` and `custom/icl_gen/select_kmeans_examples.py`
 2. selector development now lives in `scripts/selection_methods.py`
 3. fast proxy evaluation of a selector against an existing run lives in `scripts/run_selection_proxy_iteration.py`
-4. the maintained paper-style runner currently keeps the pipeline order `synthesis -> refinement -> selection` and still uses the fixed `refined -> kmeans -> cl_queue` path
+4. the maintained paper-style runner keeps the artifact order `synthesis -> refinement -> compatibility kmeans artifact`, but training now uses stage-local selector outputs built from the configured `--candidate_source`
 
 - **multi-task learning (MTL)**: `src/scripts-ni-c012/lora/all/[model_name]/[model_name].lora.[all|all_5].3ep.bs32x1x1.bf16.sh`
 - **single task (& Stage 1 in continual learning)**: `src/scripts-ni-c012/lora/sing/[model_name]/[model_name].lora.single.3ep.bs32x1x1.bf16.sh`
