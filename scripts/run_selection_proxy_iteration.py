@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import json
+import math
 import os
 import subprocess
 import sys
@@ -9,10 +11,13 @@ from pathlib import Path
 from typing import Dict, List, Mapping
 
 from selection_methods import (
+    MEAN_KL_SELECTOR_NAME,
+    PooledCandidate,
     SelectionContext,
     list_methods,
     load_jsonl,
     normalize_candidate_rows,
+    score_pooled_candidates_by_mean_kl,
     select_rows,
     write_jsonl,
 )
@@ -37,10 +42,18 @@ ARTIFACT_KEY_MAP = {
     "refined": "refined_generation_file",
     "final": "rehearsal_file",
 }
+POOLED_SELECTORS = {MEAN_KL_SELECTOR_NAME}
+MEAN_KL_SELECTION_MODES = ("global", "per_task_top_ratio")
 
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def selector_output_name(selector: str, mean_kl_selection_mode: str) -> str:
+    if selector != MEAN_KL_SELECTOR_NAME or mean_kl_selection_mode == "global":
+        return selector
+    return f"{selector}-{mean_kl_selection_mode}"
 
 
 def repo_env(cuda: str) -> Dict[str, str]:
@@ -268,6 +281,237 @@ def has_stage_scores(stage_dir: Path, eval_tasks: List[str]) -> bool:
     )
 
 
+def available_selectors() -> List[str]:
+    return sorted(set(list_methods()) | POOLED_SELECTORS)
+
+
+def resolve_global_selection_budget(
+    num_candidates: int,
+    num_previous_tasks: int,
+    sample_memory: int,
+    global_selection_count: int | None,
+    global_selection_ratio: float | None,
+) -> int:
+    if global_selection_count is not None and global_selection_ratio is not None:
+        raise ValueError(
+            "Specify at most one of --global_selection_count or --global_selection_ratio."
+        )
+
+    if global_selection_ratio is not None:
+        if not 0.0 <= global_selection_ratio <= 1.0:
+            raise ValueError("--global_selection_ratio must be between 0.0 and 1.0.")
+        budget = math.ceil(num_candidates * global_selection_ratio)
+    elif global_selection_count is not None:
+        if global_selection_count < 0:
+            raise ValueError("--global_selection_count must be non-negative.")
+        budget = global_selection_count
+    else:
+        budget = sample_memory * num_previous_tasks
+
+    return min(num_candidates, budget)
+
+
+def validate_selection_ratio(name: str, ratio: float | None) -> float:
+    if ratio is None:
+        raise ValueError(f"{name} must be provided.")
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"{name} must be between 0.0 and 1.0.")
+    return ratio
+
+
+def resolve_per_task_selection_budgets(
+    candidate_counts: Mapping[str, int],
+    selection_ratio: float,
+) -> Dict[str, int]:
+    return {
+        source_task: min(count, math.ceil(count * selection_ratio))
+        for source_task, count in candidate_counts.items()
+    }
+
+
+def run_pooled_mean_kl_selection(
+    base_run: Path,
+    model_name_or_path: str,
+    template: str,
+    selection_dir: Path,
+    output_root: Path,
+    candidate_source: str,
+    previous_tasks: List[str],
+    tasks: List[str],
+    history_checkpoints: List[Path],
+    previous_checkpoint: Path,
+    run_summary: Mapping[str, Dict[str, List[str]]],
+    sample_memory: int,
+    global_selection_count: int | None,
+    global_selection_ratio: float | None,
+    mean_kl_selection_mode: str,
+    per_task_selection_ratio: float | None,
+    max_source_length: int,
+    max_target_length: int,
+    batch_size: int,
+) -> tuple[Dict[str, Path], Dict[str, Dict[str, object]], Dict[str, object]]:
+    pooled_candidates: List[PooledCandidate] = []
+    candidate_paths: Dict[str, Path] = {}
+    candidate_counts: Dict[str, int] = {}
+
+    for source_task in previous_tasks:
+        source_task_index = tasks.index(source_task)
+        source_paths = resolve_artifact_paths(run_summary, source_task)
+        if candidate_source not in source_paths:
+            raise ValueError(
+                f"Task `{source_task}` in {base_run / 'run_summary.json'} does not expose "
+                f"a `{candidate_source}` artifact."
+            )
+
+        candidate_path = source_paths[candidate_source]
+        candidate_raw_rows = load_jsonl(candidate_path)
+        candidate_rows = normalize_candidate_rows(candidate_raw_rows)
+        candidate_paths[source_task] = candidate_path
+        candidate_counts[source_task] = len(candidate_rows)
+
+        for candidate_index, (row, raw_row) in enumerate(zip(candidate_rows, candidate_raw_rows)):
+            pooled_candidates.append(
+                PooledCandidate(
+                    source_task=source_task,
+                    source_task_index=source_task_index,
+                    source_checkpoint=checkpoint_dir(base_run, source_task_index, source_task).resolve(),
+                    candidate_index=candidate_index,
+                    row=row,
+                    raw_row=raw_row,
+                )
+            )
+
+    selection_ratio_applied: float | None = None
+    per_task_budgets: Dict[str, int] | None = None
+    if mean_kl_selection_mode == "global":
+        budget = resolve_global_selection_budget(
+            num_candidates=len(pooled_candidates),
+            num_previous_tasks=len(previous_tasks),
+            sample_memory=sample_memory,
+            global_selection_count=global_selection_count,
+            global_selection_ratio=global_selection_ratio,
+        )
+    elif mean_kl_selection_mode == "per_task_top_ratio":
+        if global_selection_count is not None or global_selection_ratio is not None:
+            raise ValueError(
+                "--global_selection_count/--global_selection_ratio cannot be used with "
+                "--mean_kl_selection_mode per_task_top_ratio."
+            )
+        selection_ratio_applied = validate_selection_ratio(
+            "--per_task_selection_ratio",
+            per_task_selection_ratio,
+        )
+        per_task_budgets = resolve_per_task_selection_budgets(
+            candidate_counts=candidate_counts,
+            selection_ratio=selection_ratio_applied,
+        )
+        budget = sum(per_task_budgets.values())
+    else:
+        raise ValueError(
+            f"Unknown mean KL selection mode `{mean_kl_selection_mode}`. "
+            f"Available modes: {', '.join(MEAN_KL_SELECTION_MODES)}"
+        )
+
+    scored_candidates = score_pooled_candidates_by_mean_kl(
+        model_name_or_path=model_name_or_path,
+        current_checkpoint=previous_checkpoint,
+        pooled_candidates=pooled_candidates,
+        template_name=template,
+        max_source_length=max_source_length,
+        max_target_length=max_target_length,
+        batch_size=batch_size,
+    )
+
+    ranked_score_path = output_root / f"{MEAN_KL_SELECTOR_NAME}_scores.{candidate_source}.jsonl"
+    ranked_rows: List[Dict[str, object]] = []
+    all_scores_by_task: Dict[str, List[float]] = defaultdict(list)
+    selected_scores_by_task: Dict[str, List[float]] = defaultdict(list)
+    selected_rows_by_task: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    selected_counts_by_task: Dict[str, int] = defaultdict(int)
+
+    for rank, scored_candidate in enumerate(scored_candidates, start=1):
+        candidate = scored_candidate.candidate
+        score = scored_candidate.mean_kl
+        all_scores_by_task[candidate.source_task].append(score)
+        ranked_rows.append(
+            {
+                "rank": rank,
+                "source_task": candidate.source_task,
+                "source_task_index": candidate.source_task_index,
+                "source_checkpoint": str(candidate.source_checkpoint),
+                "candidate_index": candidate.candidate_index,
+                "mean_kl": score,
+                "inputs": candidate.row["inputs"],
+                "targets": candidate.row["targets"],
+            }
+        )
+        should_select = False
+        if mean_kl_selection_mode == "global":
+            should_select = rank <= budget
+        else:
+            assert per_task_budgets is not None
+            should_select = selected_counts_by_task[candidate.source_task] < per_task_budgets[candidate.source_task]
+
+        if should_select:
+            selected_rows_by_task[candidate.source_task].append(candidate.row)
+            selected_scores_by_task[candidate.source_task].append(score)
+            selected_counts_by_task[candidate.source_task] += 1
+
+    write_jsonl(ranked_score_path, ranked_rows)
+
+    rehearsal_files: Dict[str, Path] = {}
+    selection_metadata: Dict[str, Dict[str, object]] = {}
+    for source_task in previous_tasks:
+        selected_rows = selected_rows_by_task.get(source_task, [])
+        selected_path: str | None = None
+        if selected_rows:
+            selection_path = selection_dir / f"{source_task}.{MEAN_KL_SELECTOR_NAME}.{candidate_source}.jsonl"
+            write_jsonl(selection_path, selected_rows)
+            rehearsal_files[source_task] = selection_path
+            selected_path = str(selection_path)
+
+        source_scores = all_scores_by_task.get(source_task, [])
+        chosen_scores = selected_scores_by_task.get(source_task, [])
+        selection_metadata[source_task] = {
+            "candidate_path": str(candidate_paths[source_task]),
+            "selected_path": selected_path,
+            "candidate_source": candidate_source,
+            "history_checkpoints": [str(path) for path in history_checkpoints],
+            "selector": MEAN_KL_SELECTOR_NAME,
+            "mean_kl_selection_mode": mean_kl_selection_mode,
+            "current_checkpoint": str(previous_checkpoint),
+            "num_candidates": candidate_counts[source_task],
+            "selected_count": len(selected_rows),
+            "selection_ratio": selection_ratio_applied,
+            "selection_budget": (
+                None
+                if per_task_budgets is None
+                else per_task_budgets[source_task]
+            ),
+            "mean_kl_min": min(source_scores) if source_scores else None,
+            "mean_kl_max": max(source_scores) if source_scores else None,
+            "selected_mean_kl_min": min(chosen_scores) if chosen_scores else None,
+            "selected_mean_kl_max": max(chosen_scores) if chosen_scores else None,
+        }
+
+    selection_pool_metadata = {
+        "selector": MEAN_KL_SELECTOR_NAME,
+        "candidate_source": candidate_source,
+        "mean_kl_selection_mode": mean_kl_selection_mode,
+        "current_checkpoint": str(previous_checkpoint),
+        "num_candidates_total": len(pooled_candidates),
+        "selected_count_total": budget,
+        "default_total_budget": sample_memory * len(previous_tasks),
+        "global_selection_count": global_selection_count,
+        "global_selection_ratio": global_selection_ratio,
+        "per_task_selection_ratio": selection_ratio_applied,
+        "per_task_selection_budgets": per_task_budgets,
+        "kl_batch_size": batch_size,
+        "score_path": str(ranked_score_path),
+    }
+    return rehearsal_files, selection_metadata, selection_pool_metadata
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_run", required=True)
@@ -275,7 +519,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--template", default="llama2")
     parser.add_argument("--iteration_task")
     parser.add_argument("--iteration_index", type=int)
-    parser.add_argument("--selector", choices=list_methods(), default="kmeans")
+    parser.add_argument("--selector", choices=available_selectors(), default="kmeans")
     parser.add_argument("--candidate_source", choices=sorted(ARTIFACT_KEY_MAP), default="refined")
     parser.add_argument(
         "--encoder_model_name_or_path",
@@ -284,6 +528,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_root")
     parser.add_argument("--cuda", default="0")
     parser.add_argument("--sample_memory", type=int, default=200)
+    parser.add_argument("--global_selection_count", type=int)
+    parser.add_argument("--global_selection_ratio", type=float)
+    parser.add_argument(
+        "--mean_kl_selection_mode",
+        choices=MEAN_KL_SELECTION_MODES,
+        default="global",
+    )
+    parser.add_argument("--per_task_selection_ratio", type=float)
+    parser.add_argument("--kl_batch_size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_source_length", type=int, default=1024)
     parser.add_argument("--max_target_length", type=int, default=512)
@@ -325,7 +578,11 @@ def main() -> None:
         else (
             repo_root()
             / "saves"
-            / f"selection-proxy-{base_run.name}-{args.selector}-{args.candidate_source}-{target_index + 1:02d}_{target_task}"
+            / (
+                f"selection-proxy-{base_run.name}-"
+                f"{selector_output_name(args.selector, args.mean_kl_selection_mode)}-"
+                f"{args.candidate_source}-{target_index + 1:02d}_{target_task}"
+            )
         ).resolve()
     )
     output_root.mkdir(parents=True, exist_ok=True)
@@ -337,57 +594,86 @@ def main() -> None:
 
     rehearsal_files: Dict[str, Path] = {}
     selection_metadata: Dict[str, Dict[str, object]] = {}
+    selection_pool_metadata: Dict[str, object] | None = None
 
-    for source_task in previous_tasks:
-        source_task_index = tasks.index(source_task)
-        source_paths = resolve_artifact_paths(run_summary, source_task)
-        if args.candidate_source not in source_paths:
+    if args.selector in POOLED_SELECTORS and previous_tasks:
+        if previous_checkpoint is None:
             raise ValueError(
-                f"Task `{source_task}` in {base_run / 'run_summary.json'} does not expose "
-                f"a `{args.candidate_source}` artifact."
+                f"Selector `{args.selector}` requires a current checkpoint, but no previous stage exists."
             )
-
-        candidate_path = source_paths[args.candidate_source]
-        candidate_raw_rows = load_jsonl(candidate_path)
-        candidate_rows = normalize_candidate_rows(candidate_raw_rows)
-        selection_path = selection_dir / f"{source_task}.{args.selector}.{args.candidate_source}.jsonl"
-
-        context = SelectionContext(
-            method_name=args.selector,
-            source_task=source_task,
-            source_task_index=source_task_index,
-            source_checkpoint=checkpoint_dir(base_run, source_task_index, source_task).resolve(),
-            target_task=target_task,
-            target_index=target_index,
+        rehearsal_files, selection_metadata, selection_pool_metadata = run_pooled_mean_kl_selection(
+            base_run=base_run,
+            model_name_or_path=args.model_name_or_path,
+            template=args.template,
+            selection_dir=selection_dir,
+            output_root=output_root,
+            candidate_source=args.candidate_source,
+            previous_tasks=previous_tasks,
+            tasks=tasks,
+            history_checkpoints=history_checkpoints,
+            previous_checkpoint=previous_checkpoint,
+            run_summary=run_summary,
             sample_memory=args.sample_memory,
-            seed=args.seed,
-            encoder_model_name_or_path=args.encoder_model_name_or_path,
-            base_run_dir=base_run,
-            candidate_source_name=args.candidate_source,
-            candidate_path=candidate_path,
-            candidate_rows=candidate_rows,
-            candidate_raw_rows=candidate_raw_rows,
-            source_paths=source_paths,
-            history_tasks=list(previous_tasks),
-            history_checkpoints=list(history_checkpoints),
-            work_dir=output_root,
+            global_selection_count=args.global_selection_count,
+            global_selection_ratio=args.global_selection_ratio,
+            mean_kl_selection_mode=args.mean_kl_selection_mode,
+            per_task_selection_ratio=args.per_task_selection_ratio,
+            max_source_length=args.max_source_length,
+            max_target_length=args.max_target_length,
+            batch_size=args.kl_batch_size,
         )
-        result = select_rows(args.selector, context)
-        write_jsonl(selection_path, result.rows)
+    else:
+        for source_task in previous_tasks:
+            source_task_index = tasks.index(source_task)
+            source_paths = resolve_artifact_paths(run_summary, source_task)
+            if args.candidate_source not in source_paths:
+                raise ValueError(
+                    f"Task `{source_task}` in {base_run / 'run_summary.json'} does not expose "
+                    f"a `{args.candidate_source}` artifact."
+                )
 
-        rehearsal_files[source_task] = selection_path
-        selection_metadata[source_task] = {
-            "candidate_path": str(candidate_path),
-            "selected_path": str(selection_path),
-            "candidate_source": args.candidate_source,
-            "history_checkpoints": [str(path) for path in history_checkpoints],
-            **result.metadata,
-        }
+            candidate_path = source_paths[args.candidate_source]
+            candidate_raw_rows = load_jsonl(candidate_path)
+            candidate_rows = normalize_candidate_rows(candidate_raw_rows)
+            selection_path = selection_dir / f"{source_task}.{args.selector}.{args.candidate_source}.jsonl"
+
+            context = SelectionContext(
+                method_name=args.selector,
+                source_task=source_task,
+                source_task_index=source_task_index,
+                source_checkpoint=checkpoint_dir(base_run, source_task_index, source_task).resolve(),
+                target_task=target_task,
+                target_index=target_index,
+                sample_memory=args.sample_memory,
+                seed=args.seed,
+                encoder_model_name_or_path=args.encoder_model_name_or_path,
+                base_run_dir=base_run,
+                candidate_source_name=args.candidate_source,
+                candidate_path=candidate_path,
+                candidate_rows=candidate_rows,
+                candidate_raw_rows=candidate_raw_rows,
+                source_paths=source_paths,
+                history_tasks=list(previous_tasks),
+                history_checkpoints=list(history_checkpoints),
+                work_dir=output_root,
+            )
+            result = select_rows(args.selector, context)
+            write_jsonl(selection_path, result.rows)
+
+            rehearsal_files[source_task] = selection_path
+            selection_metadata[source_task] = {
+                "candidate_path": str(candidate_path),
+                "selected_path": str(selection_path),
+                "candidate_source": args.candidate_source,
+                "history_checkpoints": [str(path) for path in history_checkpoints],
+                **result.metadata,
+            }
 
     rehearsal_dataset_keys = write_dataset_registry(dataset_dir, tasks, rehearsal_files)
 
     train_datasets = [f"ni_c012_{target_task}_train"]
-    train_datasets.extend(rehearsal_dataset_keys[source_task] for source_task in previous_tasks)
+    selected_source_tasks = [source_task for source_task in previous_tasks if source_task in rehearsal_dataset_keys]
+    train_datasets.extend(rehearsal_dataset_keys[source_task] for source_task in selected_source_tasks)
 
     current_stage_dir = checkpoint_dir(output_root, target_index, target_task)
     current_stage_dir.mkdir(parents=True, exist_ok=True)
@@ -471,9 +757,11 @@ def main() -> None:
         "target_index": target_index + 1,
         "target_task": target_task,
         "previous_tasks": previous_tasks,
+        "selected_source_tasks": selected_source_tasks,
         "previous_checkpoint": str(previous_checkpoint) if previous_checkpoint else None,
         "selector": args.selector,
         "candidate_source": args.candidate_source,
+        "selection_pool": selection_pool_metadata,
         "selection": selection_metadata,
         "dataset_dir": str(dataset_dir),
         "stage_dir": str(current_stage_dir),

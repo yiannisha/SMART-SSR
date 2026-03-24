@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import random
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping
@@ -8,11 +10,21 @@ from typing import Callable, Dict, List, Mapping
 import jsonlines
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
+import torch.nn.functional as F
+from peft import PeftModelForCausalLM
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+
+SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from llmtuner.extras.template import get_template_and_fix_tokenizer
 
 
 SelectorFn = Callable[["SelectionContext"], "SelectionResult"]
 SELECTORS: Dict[str, SelectorFn] = {}
+MEAN_KL_SELECTOR_NAME = "mean_kl"
 
 
 @dataclass(frozen=True)
@@ -43,6 +55,22 @@ class SelectionResult:
     metadata: Dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PooledCandidate:
+    source_task: str
+    source_task_index: int
+    source_checkpoint: Path
+    candidate_index: int
+    row: Dict[str, str]
+    raw_row: Dict
+
+
+@dataclass(frozen=True)
+class ScoredCandidate:
+    candidate: PooledCandidate
+    mean_kl: float
+
+
 def register_selector(name: str) -> Callable[[SelectorFn], SelectorFn]:
     def decorator(func: SelectorFn) -> SelectorFn:
         SELECTORS[name] = func
@@ -64,6 +92,20 @@ def write_jsonl(path: Path, rows: List[Dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(path, "w") as writer:
         writer.write_all(rows)
+
+
+def get_model_dtype() -> torch.dtype:
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        return torch.float16
+    return torch.float32
+
+
+def cleanup_cuda_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def normalize_candidate_rows(rows: List[Dict]) -> List[Dict[str, str]]:
@@ -88,6 +130,198 @@ def normalize_candidate_rows(rows: List[Dict]) -> List[Dict[str, str]]:
         normalized.append({"inputs": prompt, "targets": target})
 
     return normalized
+
+
+def model_input_device(model: torch.nn.Module) -> torch.device:
+    return model.get_input_embeddings().weight.device
+
+
+def build_source_adapter_name(source_task: str) -> str:
+    sanitized = "".join(
+        character if character.isalnum() or character in {"_", "-"} else "_"
+        for character in source_task
+    )
+    return f"source_{sanitized}"
+
+
+def build_scoring_batch(
+    rows: List[Dict[str, str]],
+    tokenizer,
+    template,
+    max_source_length: int,
+    max_target_length: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_id_rows: List[List[int]] = []
+    target_mask_rows: List[List[int]] = []
+
+    for row in rows:
+        source_ids, target_ids = template.encode_oneturn(
+            tokenizer,
+            row["inputs"],
+            row["targets"],
+            history=None,
+            system=None,
+        )
+        if len(source_ids) > max_source_length:
+            source_ids = source_ids[:max_source_length]
+        if len(target_ids) > max_target_length:
+            target_ids = target_ids[:max_target_length]
+        if template.efficient_eos:
+            target_ids = target_ids + [tokenizer.eos_token_id]
+        if not target_ids:
+            raise ValueError("Encountered a candidate row with an empty target after truncation.")
+
+        input_ids = source_ids + target_ids
+        target_mask = [0] * len(source_ids) + [1] * len(target_ids)
+        input_id_rows.append(input_ids)
+        target_mask_rows.append(target_mask)
+
+    max_length = max(len(row) for row in input_id_rows)
+    pad_token_id = tokenizer.pad_token_id
+    padded_inputs: List[List[int]] = []
+    padded_attention_masks: List[List[int]] = []
+    padded_target_masks: List[List[int]] = []
+
+    for input_ids, target_mask in zip(input_id_rows, target_mask_rows):
+        pad_len = max_length - len(input_ids)
+        padded_inputs.append(input_ids + [pad_token_id] * pad_len)
+        padded_attention_masks.append([1] * len(input_ids) + [0] * pad_len)
+        padded_target_masks.append(target_mask + [0] * pad_len)
+
+    return (
+        torch.tensor(padded_inputs, dtype=torch.long, device=device),
+        torch.tensor(padded_target_masks, dtype=torch.bool, device=device),
+        torch.tensor(padded_attention_masks, dtype=torch.long, device=device),
+    )
+
+
+@torch.inference_mode()
+def mean_distribution_shift(
+    model,
+    snapshot_adapter_name: str,
+    current_adapter_name: str,
+    input_ids: torch.Tensor,
+    target_mask: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if snapshot_adapter_name == current_adapter_name:
+        return torch.zeros(input_ids.size(0), dtype=torch.float32, device=input_ids.device)
+
+    model.set_adapter(snapshot_adapter_name)
+    snapshot_logits = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    ).logits[:, :-1, :]
+
+    model.set_adapter(current_adapter_name)
+    current_logits = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    ).logits[:, :-1, :]
+
+    log_p = F.log_softmax(snapshot_logits, dim=-1, dtype=torch.float32)
+    log_q = F.log_softmax(current_logits, dim=-1, dtype=torch.float32)
+    kl_per_pos = F.kl_div(log_q, log_p, reduction="none", log_target=True).sum(dim=-1)
+
+    valid_mask = target_mask[:, 1:].to(kl_per_pos.dtype)
+    if attention_mask is not None:
+        valid_mask = valid_mask * attention_mask[:, 1:].to(kl_per_pos.dtype)
+
+    denom = valid_mask.sum(dim=-1).clamp_min(1.0)
+    mean_kl = (kl_per_pos * valid_mask).sum(dim=-1) / denom
+    return mean_kl
+
+
+def score_pooled_candidates_by_mean_kl(
+    model_name_or_path: str,
+    current_checkpoint: Path,
+    pooled_candidates: List[PooledCandidate],
+    template_name: str,
+    max_source_length: int,
+    max_target_length: int,
+    batch_size: int = 1,
+) -> List[ScoredCandidate]:
+    if batch_size <= 0:
+        raise ValueError("KL batch size must be positive.")
+    if not pooled_candidates:
+        return []
+    if not current_checkpoint.exists():
+        raise FileNotFoundError(f"Current checkpoint does not exist: {current_checkpoint}")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    template = get_template_and_fix_tokenizer(template_name, tokenizer)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        torch_dtype=get_model_dtype(),
+        device_map="auto" if torch.cuda.is_available() else None,
+        low_cpu_mem_usage=True,
+    )
+    model = PeftModelForCausalLM.from_pretrained(
+        model,
+        str(current_checkpoint),
+        adapter_name="current",
+        is_trainable=False,
+    )
+    model.eval()
+
+    device = model_input_device(model)
+    candidates_by_task: Dict[str, List[PooledCandidate]] = {}
+    source_checkpoints: Dict[str, Path] = {}
+    for candidate in pooled_candidates:
+        candidates_by_task.setdefault(candidate.source_task, []).append(candidate)
+        source_checkpoints[candidate.source_task] = candidate.source_checkpoint
+
+    scored_candidates: List[ScoredCandidate] = []
+    current_checkpoint_resolved = current_checkpoint.resolve()
+
+    try:
+        for source_task, task_candidates in candidates_by_task.items():
+            source_checkpoint = source_checkpoints[source_task].resolve()
+            source_adapter_name = "current"
+            if source_checkpoint != current_checkpoint_resolved:
+                source_adapter_name = build_source_adapter_name(source_task)
+                model.load_adapter(
+                    str(source_checkpoint),
+                    adapter_name=source_adapter_name,
+                    is_trainable=False,
+                )
+
+            for start in range(0, len(task_candidates), batch_size):
+                batch_candidates = task_candidates[start:start + batch_size]
+                input_ids, target_mask, attention_mask = build_scoring_batch(
+                    rows=[candidate.row for candidate in batch_candidates],
+                    tokenizer=tokenizer,
+                    template=template,
+                    max_source_length=max_source_length,
+                    max_target_length=max_target_length,
+                    device=device,
+                )
+                batch_scores = mean_distribution_shift(
+                    model=model,
+                    snapshot_adapter_name=source_adapter_name,
+                    current_adapter_name="current",
+                    input_ids=input_ids,
+                    target_mask=target_mask,
+                    attention_mask=attention_mask,
+                )
+                for candidate, score in zip(batch_candidates, batch_scores.tolist()):
+                    scored_candidates.append(
+                        ScoredCandidate(
+                            candidate=candidate,
+                            mean_kl=float(score),
+                        )
+                    )
+
+                del input_ids, target_mask, attention_mask, batch_scores
+
+            cleanup_cuda_memory()
+    finally:
+        del model
+        cleanup_cuda_memory()
+
+    return sorted(scored_candidates, key=lambda candidate: candidate.mean_kl, reverse=True)
 
 
 def pooled_embeddings(model_output) -> torch.Tensor:
