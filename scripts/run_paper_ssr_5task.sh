@@ -26,6 +26,8 @@ else
   source "$REPO_ROOT_DIR/.venv/bin/activate"
 fi
 
-python "$REPO_ROOT_DIR/scripts/prepare_experiment_data.py"
+if [[ "${PREPARE_EXPERIMENT_DATA:-0}" == "1" ]]; then
+  python "$REPO_ROOT_DIR/scripts/prepare_experiment_data.py"
+fi
 
 python "$REPO_ROOT_DIR/scripts/run_paper_ssr_5task.py" "$@"
