@@ -252,9 +252,10 @@ Notes:
 - `--candidate_source` accepts `raw`, `parsed`, `refined` or `final`.
 - `--skip_train --skip_eval` materializes only the selected rehearsal subsets.
 - The replay runner uses an experiment-local `dataset_info.json` and does not modify `data/dataset_info.json`.
-- `mean_kl` supports `--mean_kl_selection_mode global` and `--mean_kl_selection_mode per_task_top_ratio`.
-- `uncertainty_band` supports `--uncertainty_selection_mode global` and `--uncertainty_selection_mode per_task_top_ratio`.
+- `mean_kl` supports `--mean_kl_selection_mode global`, `--mean_kl_selection_mode per_task_top_ratio`, and `--mean_kl_selection_mode per_task_top_count`.
+- `uncertainty_band` supports `--uncertainty_selection_mode global`, `--uncertainty_selection_mode per_task_top_ratio`, and `--uncertainty_selection_mode per_task_top_count`.
 - `--h_min` and `--h_max` are percentile cutoffs in `[0.0, 1.0]`, not raw entropy values. `0.25` / `0.75` means the middle 50% entropy band of the scored candidate set, or of each source task in `per_task_top_ratio` mode.
+- `--per_task_selection_count` applies a fixed cap per prior task when you use a `per_task_top_count` mode. This is the fair-budget option if you want pooled selectors to match the legacy 200-per-task rehearsal budget.
 - Use the replay path for fast selector iteration; the full paper-style runner now accepts `--selector` and writes stage-local training inputs under `<output_root>/stage_data/<stage>/`.
 - If you rerun the same paper-style `output_root` without `--skip_completed`, the runner refreshes `refined` and `final` for any retrained stage.
 

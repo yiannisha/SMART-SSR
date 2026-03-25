@@ -64,7 +64,7 @@ ARTIFACT_KEY_MAP = {
     "final": "rehearsal_file",
 }
 POOLED_SELECTORS = {MEAN_KL_SELECTOR_NAME, UNCERTAINTY_BAND_SELECTOR_NAME}
-POOLED_SELECTION_MODES = ("global", "per_task_top_ratio")
+POOLED_SELECTION_MODES = ("global", "per_task_top_ratio", "per_task_top_count")
 
 
 def available_selectors() -> List[str]:
@@ -244,6 +244,18 @@ def resolve_per_task_selection_budgets(
 ) -> Dict[str, int]:
     return {
         source_task: min(count, math.ceil(count * selection_ratio))
+        for source_task, count in candidate_counts.items()
+    }
+
+
+def resolve_per_task_selection_budgets_by_count(
+    candidate_counts: Mapping[str, int],
+    selection_count: int,
+) -> Dict[str, int]:
+    if selection_count < 0:
+        raise ValueError("--per_task_selection_count must be non-negative.")
+    return {
+        source_task: min(count, selection_count)
         for source_task, count in candidate_counts.items()
     }
 
@@ -517,6 +529,7 @@ def select_stage_rehearsal_files(
     global_selection_ratio: float | None,
     pooled_selection_mode: str,
     per_task_selection_ratio: float | None,
+    per_task_selection_count: int | None,
     max_source_length: int,
     max_target_length: int,
     kl_batch_size: int,
@@ -572,6 +585,7 @@ def select_stage_rehearsal_files(
                 )
 
         selection_ratio_applied: float | None = None
+        selection_count_applied: int | None = None
         per_task_budgets: Dict[str, int] | None = None
         if pooled_selection_mode == "global":
             budget = resolve_global_selection_budget(
@@ -594,6 +608,24 @@ def select_stage_rehearsal_files(
             per_task_budgets = resolve_per_task_selection_budgets(
                 candidate_counts=candidate_counts,
                 selection_ratio=selection_ratio_applied,
+            )
+            budget = sum(per_task_budgets.values())
+        elif pooled_selection_mode == "per_task_top_count":
+            if (
+                global_selection_count is not None
+                or global_selection_ratio is not None
+                or per_task_selection_ratio is not None
+            ):
+                raise ValueError(
+                    "--global_selection_count/--global_selection_ratio/--per_task_selection_ratio "
+                    f"cannot be used with {pooled_selection_mode_flag(selector)} per_task_top_count."
+                )
+            if per_task_selection_count is None:
+                raise ValueError("--per_task_selection_count must be provided.")
+            selection_count_applied = per_task_selection_count
+            per_task_budgets = resolve_per_task_selection_budgets_by_count(
+                candidate_counts=candidate_counts,
+                selection_count=selection_count_applied,
             )
             budget = sum(per_task_budgets.values())
         else:
@@ -733,6 +765,7 @@ def select_stage_rehearsal_files(
                 "num_candidates": candidate_counts[source_task],
                 "selected_count": len(selected_rows),
                 "selection_ratio": selection_ratio_applied,
+                "selection_count": selection_count_applied,
                 "selection_budget": (
                     None
                     if per_task_budgets is None
@@ -774,6 +807,7 @@ def select_stage_rehearsal_files(
             "global_selection_count": global_selection_count,
             "global_selection_ratio": global_selection_ratio,
             "per_task_selection_ratio": selection_ratio_applied,
+            "per_task_selection_count": selection_count_applied,
             "per_task_selection_budgets": per_task_budgets,
             "score_path": str(ranked_score_path),
             **scoring_metadata,
@@ -900,6 +934,7 @@ def main() -> None:
         default="global",
     )
     parser.add_argument("--per_task_selection_ratio", type=float)
+    parser.add_argument("--per_task_selection_count", type=int)
     parser.add_argument("--kl_batch_size", type=int, default=1)
     parser.add_argument("--uncertainty_batch_size", type=int, default=1)
     parser.add_argument("--h_min", "--uncertainty_h_min", dest="h_min", type=float, default=0.25)
@@ -979,6 +1014,7 @@ def main() -> None:
                 global_selection_ratio=args.global_selection_ratio,
                 pooled_selection_mode=pooled_selection_mode,
                 per_task_selection_ratio=args.per_task_selection_ratio,
+                per_task_selection_count=args.per_task_selection_count,
                 max_source_length=args.max_source_length,
                 max_target_length=args.max_target_length,
                 kl_batch_size=args.kl_batch_size,
