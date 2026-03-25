@@ -29,6 +29,7 @@ SelectorFn = Callable[["SelectionContext"], "SelectionResult"]
 SELECTORS: Dict[str, SelectorFn] = {}
 MEAN_KL_SELECTOR_NAME = "mean_kl"
 UNCERTAINTY_BAND_SELECTOR_NAME = "uncertainty_band"
+KMEANS_SELECTOR_N_CLUSTER = 20
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,16 @@ class UncertaintyBandScoringResult:
     band_by_source_task: Mapping[str, Dict[str, float]]
 
 
+@dataclass(frozen=True)
+class KMeansSelectionState:
+    n_cluster: int
+    labels: np.ndarray
+    centers: np.ndarray
+    centroid_distances: np.ndarray
+    counts: np.ndarray
+    allocations: np.ndarray
+
+
 def register_selector(name: str) -> Callable[[SelectorFn], SelectorFn]:
     def decorator(func: SelectorFn) -> SelectorFn:
         SELECTORS[name] = func
@@ -114,6 +125,11 @@ def write_jsonl(path: Path, rows: List[Dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(path, "w") as writer:
         writer.write_all(rows)
+
+
+def normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(embeddings, axis=-1, keepdims=True)
+    return embeddings / np.clip(norms, a_min=1e-12, a_max=None)
 
 
 def is_stale_file_handle_error(exc: BaseException) -> bool:
@@ -574,7 +590,7 @@ def score_pooled_candidates_by_uncertainty_band(
                 "band_min_entropy": band_min_entropy,
                 "band_max_entropy": band_max_entropy,
             }
-    elif selection_mode in {"per_task_top_ratio", "per_task_top_count"}:
+    elif selection_mode in {"per_task_top_ratio", "per_task_top_count", "per_cluster"}:
         for source_task, task_candidate_entropies in entropies_by_task.items():
             task_mean_entropies = [item.mean_entropy for item in task_candidate_entropies]
             task_band_min_entropy, task_band_max_entropy = resolve_entropy_band_bounds(
@@ -604,7 +620,7 @@ def score_pooled_candidates_by_uncertainty_band(
     else:
         raise ValueError(
             f"Unknown uncertainty selection mode `{selection_mode}`. "
-            "Available modes: global, per_task_top_ratio, per_task_top_count"
+            "Available modes: global, per_task_top_ratio, per_task_top_count, per_cluster"
         )
 
     return UncertaintyBandScoringResult(
@@ -646,6 +662,134 @@ def encode_texts(texts: List[str], model_name_or_path: str, batch_size: int = 32
     return np.concatenate(embeddings, axis=0)
 
 
+def allocate_cluster_samples(
+    counts: np.ndarray,
+    sample_size: int,
+    total_count: int,
+) -> np.ndarray:
+    raw_allocations = counts * float(sample_size) / float(total_count)
+    allocations = np.floor(raw_allocations).astype(int)
+    remainder = sample_size - int(allocations.sum())
+    if remainder > 0:
+        order = np.argsort(-(raw_allocations - allocations))
+        for idx in order[:remainder]:
+            allocations[idx] += 1
+    return allocations
+
+
+def build_kmeans_selection_state(
+    embeddings: np.ndarray,
+    sample_size: int,
+    n_cluster: int,
+    seed: int,
+) -> KMeansSelectionState | None:
+    if len(embeddings) <= sample_size:
+        return None
+
+    normalized_embeddings = normalize_embeddings(embeddings)
+    n_cluster = min(n_cluster, len(normalized_embeddings))
+    labels, centers = fit_kmeans(normalized_embeddings, n_cluster=n_cluster, seed=seed)
+    centroid_distances = np.linalg.norm(normalized_embeddings - centers[labels], axis=-1)
+    counts = np.bincount(labels, minlength=n_cluster)
+    allocations = allocate_cluster_samples(counts, sample_size, len(normalized_embeddings))
+    return KMeansSelectionState(
+        n_cluster=n_cluster,
+        labels=labels,
+        centers=centers,
+        centroid_distances=centroid_distances,
+        counts=counts,
+        allocations=allocations,
+    )
+
+
+def order_indices_by_scores(
+    indices: np.ndarray,
+    scores: np.ndarray,
+    descending: bool,
+) -> np.ndarray:
+    ordered = np.argsort(-scores[indices] if descending else scores[indices])
+    return indices[ordered]
+
+
+def select_indices_by_cluster_scores(
+    state: KMeansSelectionState,
+    ranking_scores: np.ndarray,
+    sample_size: int,
+    descending: bool,
+    fallback_scores: np.ndarray | None = None,
+    fallback_descending: bool | None = None,
+) -> List[int]:
+    ranking_scores = np.asarray(ranking_scores)
+    if ranking_scores.shape[0] != state.labels.shape[0]:
+        raise ValueError("Ranking scores must align with k-means labels.")
+
+    selected_indices: List[int] = []
+    for cluster_id in range(state.n_cluster):
+        cluster_indices = np.where(state.labels == cluster_id)[0]
+        if cluster_indices.size == 0 or state.allocations[cluster_id] == 0:
+            continue
+        ordered_indices = order_indices_by_scores(
+            cluster_indices,
+            ranking_scores,
+            descending=descending,
+        )
+        selected_indices.extend(ordered_indices[:state.allocations[cluster_id]].tolist())
+
+    if len(selected_indices) < sample_size:
+        seen = set(selected_indices)
+        fallback_scores = ranking_scores if fallback_scores is None else np.asarray(fallback_scores)
+        fallback_descending = descending if fallback_descending is None else fallback_descending
+        fallback_indices = order_indices_by_scores(
+            np.arange(len(state.labels)),
+            fallback_scores,
+            descending=fallback_descending,
+        )
+        for idx in fallback_indices:
+            if int(idx) in seen:
+                continue
+            selected_indices.append(int(idx))
+            if len(selected_indices) >= sample_size:
+                break
+
+    return selected_indices[:sample_size]
+
+
+def select_by_kmeans_score_indices(
+    rows: List[Dict[str, str]],
+    ranking_scores: np.ndarray,
+    encoder_model_name_or_path: str,
+    sample_size: int,
+    seed: int,
+    n_cluster: int = KMEANS_SELECTOR_N_CLUSTER,
+    descending: bool = True,
+    fallback_scores: np.ndarray | None = None,
+    fallback_descending: bool | None = None,
+) -> tuple[List[int], KMeansSelectionState | None]:
+    if len(rows) <= sample_size:
+        return list(range(len(rows))), None
+
+    texts = [row["inputs"] for row in rows]
+    embeddings = encode_texts(texts, encoder_model_name_or_path)
+    state = build_kmeans_selection_state(
+        embeddings=embeddings,
+        sample_size=sample_size,
+        n_cluster=n_cluster,
+        seed=seed,
+    )
+    if state is None:
+        return list(range(len(rows))), None
+
+    selected_indices = select_indices_by_cluster_scores(
+        state=state,
+        ranking_scores=ranking_scores,
+        sample_size=sample_size,
+        descending=descending,
+        fallback_scores=fallback_scores,
+        fallback_descending=fallback_descending,
+    )
+    return selected_indices, state
+
+
 def select_by_kmeans_indices(
     embeddings: np.ndarray,
     sample_size: int,
@@ -655,42 +799,21 @@ def select_by_kmeans_indices(
     if len(embeddings) <= sample_size:
         return list(range(len(embeddings)))
 
-    norms = np.linalg.norm(embeddings, axis=-1, keepdims=True)
-    embeddings = embeddings / np.clip(norms, a_min=1e-12, a_max=None)
+    state = build_kmeans_selection_state(
+        embeddings=embeddings,
+        sample_size=sample_size,
+        n_cluster=n_cluster,
+        seed=seed,
+    )
+    if state is None:
+        return list(range(len(embeddings)))
 
-    n_cluster = min(n_cluster, len(embeddings))
-    labels, centers = fit_kmeans(embeddings, n_cluster=n_cluster, seed=seed)
-    distances = np.linalg.norm(embeddings - centers[labels], axis=-1)
-
-    counts = np.bincount(labels, minlength=n_cluster)
-    raw_allocations = counts * float(sample_size) / float(len(embeddings))
-    allocations = np.floor(raw_allocations).astype(int)
-    remainder = sample_size - int(allocations.sum())
-    if remainder > 0:
-        order = np.argsort(-(raw_allocations - allocations))
-        for idx in order[:remainder]:
-            allocations[idx] += 1
-
-    selected_indices: List[int] = []
-    for cluster_id in range(n_cluster):
-        cluster_indices = np.where(labels == cluster_id)[0]
-        if cluster_indices.size == 0 or allocations[cluster_id] == 0:
-            continue
-        cluster_distances = distances[cluster_indices]
-        ordered_indices = cluster_indices[np.argsort(cluster_distances)]
-        selected_indices.extend(ordered_indices[:allocations[cluster_id]].tolist())
-
-    if len(selected_indices) < sample_size:
-        seen = set(selected_indices)
-        fallback_order = np.argsort(distances)
-        for idx in fallback_order:
-            if idx in seen:
-                continue
-            selected_indices.append(int(idx))
-            if len(selected_indices) >= sample_size:
-                break
-
-    return selected_indices[:sample_size]
+    return select_indices_by_cluster_scores(
+        state=state,
+        ranking_scores=state.centroid_distances,
+        sample_size=sample_size,
+        descending=False,
+    )
 
 
 def init_kmeans_plus_plus(
@@ -798,7 +921,7 @@ def kmeans_selector(context: SelectionContext) -> SelectionResult:
                 "encoder_model_name_or_path": context.encoder_model_name_or_path,
                 "num_candidates": len(context.candidate_rows),
                 "selected_count": len(rows),
-                "n_cluster": min(20, len(rows)),
+                "n_cluster": min(KMEANS_SELECTOR_N_CLUSTER, len(rows)),
             },
         )
 
@@ -807,7 +930,7 @@ def kmeans_selector(context: SelectionContext) -> SelectionResult:
     selected_indices = select_by_kmeans_indices(
         embeddings=embeddings,
         sample_size=context.sample_memory,
-        n_cluster=20,
+        n_cluster=KMEANS_SELECTOR_N_CLUSTER,
         seed=context.seed,
     )
     rows = [context.candidate_rows[idx] for idx in selected_indices]
@@ -818,6 +941,6 @@ def kmeans_selector(context: SelectionContext) -> SelectionResult:
             "encoder_model_name_or_path": context.encoder_model_name_or_path,
             "num_candidates": len(context.candidate_rows),
             "selected_count": len(rows),
-            "n_cluster": min(20, len(context.candidate_rows)),
+            "n_cluster": min(KMEANS_SELECTOR_N_CLUSTER, len(context.candidate_rows)),
         },
     )

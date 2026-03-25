@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Mapping
 
 from selection_methods import (
+    KMEANS_SELECTOR_N_CLUSTER,
     MEAN_KL_SELECTOR_NAME,
     UNCERTAINTY_BAND_SELECTOR_NAME,
     PooledCandidate,
@@ -17,6 +18,7 @@ from selection_methods import (
     load_jsonl,
     normalize_candidate_rows,
     safe_hf_cache_dir,
+    select_by_kmeans_score_indices,
     score_pooled_candidates_by_mean_kl,
     score_pooled_candidates_by_uncertainty_band,
     select_rows,
@@ -64,7 +66,7 @@ ARTIFACT_KEY_MAP = {
     "final": "rehearsal_file",
 }
 POOLED_SELECTORS = {MEAN_KL_SELECTOR_NAME, UNCERTAINTY_BAND_SELECTOR_NAME}
-POOLED_SELECTION_MODES = ("global", "per_task_top_ratio", "per_task_top_count")
+POOLED_SELECTION_MODES = ("global", "per_task_top_ratio", "per_task_top_count", "per_cluster")
 
 
 def available_selectors() -> List[str]:
@@ -554,6 +556,7 @@ def select_stage_rehearsal_files(
         pooled_candidates: List[PooledCandidate] = []
         candidate_paths: Dict[str, Path] = {}
         candidate_counts: Dict[str, int] = {}
+        candidate_rows_by_task: Dict[str, List[Dict[str, str]]] = {}
 
         for source_task in previous_tasks:
             source_task_index = tasks.index(source_task)
@@ -567,6 +570,7 @@ def select_stage_rehearsal_files(
             candidate_rows = normalize_candidate_rows(candidate_raw_rows)
             candidate_paths[source_task] = candidate_path
             candidate_counts[source_task] = len(candidate_rows)
+            candidate_rows_by_task[source_task] = candidate_rows
 
             for candidate_index, (row, raw_row) in enumerate(zip(candidate_rows, candidate_raw_rows)):
                 pooled_candidates.append(
@@ -627,6 +631,23 @@ def select_stage_rehearsal_files(
                 candidate_counts=candidate_counts,
                 selection_count=selection_count_applied,
             )
+            budget = sum(per_task_budgets.values())
+        elif pooled_selection_mode == "per_cluster":
+            if (
+                global_selection_count is not None
+                or global_selection_ratio is not None
+                or per_task_selection_ratio is not None
+                or per_task_selection_count is not None
+            ):
+                raise ValueError(
+                    "--global_selection_count/--global_selection_ratio/--per_task_selection_ratio/"
+                    "--per_task_selection_count cannot be used with "
+                    f"{pooled_selection_mode_flag(selector)} per_cluster."
+                )
+            per_task_budgets = {
+                source_task: min(count, sample_memory)
+                for source_task, count in candidate_counts.items()
+            }
             budget = sum(per_task_budgets.values())
         else:
             raise ValueError(
@@ -694,6 +715,63 @@ def select_stage_rehearsal_files(
         selected_entropies_by_task: Dict[str, List[float]] = defaultdict(list)
         selected_rows_by_task: Dict[str, List[Dict[str, str]]] = defaultdict(list)
         selected_counts_by_task: Dict[str, int] = defaultdict(int)
+        cluster_selection_by_task: Dict[str, Dict[str, object]] = {}
+        selected_candidate_keys: set[tuple[str, int]] = set()
+
+        if pooled_selection_mode == "per_cluster":
+            scored_candidates_by_task: Dict[str, Dict[int, object]] = defaultdict(dict)
+            for scored_candidate in scored_candidates:
+                candidate = scored_candidate.candidate
+                scored_candidates_by_task[candidate.source_task][candidate.candidate_index] = scored_candidate
+
+            for source_task in previous_tasks:
+                task_rows = candidate_rows_by_task[source_task]
+                task_scored_candidates = scored_candidates_by_task[source_task]
+                if len(task_scored_candidates) != len(task_rows):
+                    raise ValueError(
+                        f"Per-cluster selection expected one score per candidate for task `{source_task}`."
+                    )
+
+                task_scores = [
+                    float(task_scored_candidates[candidate_index].score)
+                    for candidate_index in range(len(task_rows))
+                ]
+                selected_indices, cluster_state = select_by_kmeans_score_indices(
+                    rows=task_rows,
+                    ranking_scores=task_scores,
+                    encoder_model_name_or_path=encoder_model_name_or_path,
+                    sample_size=sample_memory,
+                    seed=seed,
+                    n_cluster=KMEANS_SELECTOR_N_CLUSTER,
+                    descending=True,
+                )
+                selected_rows_by_task[source_task] = [task_rows[idx] for idx in selected_indices]
+                selected_scores_by_task[source_task] = [task_scores[idx] for idx in selected_indices]
+                selected_counts_by_task[source_task] = len(selected_indices)
+                selected_candidate_keys.update((source_task, idx) for idx in selected_indices)
+                cluster_selection_by_task[source_task] = {
+                    "kmeans_clustered": cluster_state is not None,
+                    "kmeans_n_cluster": min(KMEANS_SELECTOR_N_CLUSTER, len(task_rows)),
+                    "kmeans_cluster_counts": (
+                        None
+                        if cluster_state is None
+                        else [int(count) for count in cluster_state.counts.tolist()]
+                    ),
+                    "kmeans_cluster_allocations": (
+                        None
+                        if cluster_state is None
+                        else [int(allocation) for allocation in cluster_state.allocations.tolist()]
+                    ),
+                }
+
+                if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+                    selected_entropies: List[float] = []
+                    for idx in selected_indices:
+                        mean_entropy = task_scored_candidates[idx].mean_entropy
+                        if mean_entropy is None:
+                            raise ValueError("Uncertainty scoring must populate mean entropy.")
+                        selected_entropies.append(mean_entropy)
+                    selected_entropies_by_task[source_task] = selected_entropies
 
         for rank, scored_candidate in enumerate(scored_candidates, start=1):
             candidate = scored_candidate.candidate
@@ -717,6 +795,13 @@ def select_stage_rehearsal_files(
                 if task_band is not None:
                     ranked_row["entropy_band_min"] = task_band["band_min_entropy"]
                     ranked_row["entropy_band_max"] = task_band["band_max_entropy"]
+            if pooled_selection_mode == "per_cluster":
+                ranked_row["selected"] = (
+                    candidate.source_task,
+                    candidate.candidate_index,
+                ) in selected_candidate_keys
+                ranked_rows.append(ranked_row)
+                continue
             ranked_rows.append(ranked_row)
 
             should_select = False
@@ -795,6 +880,8 @@ def select_stage_rehearsal_files(
                         "entropy_band_max": task_band.get("band_max_entropy"),
                     }
                 )
+            if pooled_selection_mode == "per_cluster":
+                selection_metadata[source_task].update(cluster_selection_by_task.get(source_task, {}))
 
         selection_pool_metadata = {
             "selector": selector,
@@ -809,6 +896,7 @@ def select_stage_rehearsal_files(
             "per_task_selection_ratio": selection_ratio_applied,
             "per_task_selection_count": selection_count_applied,
             "per_task_selection_budgets": per_task_budgets,
+            "per_task_cluster_selection": cluster_selection_by_task or None,
             "score_path": str(ranked_score_path),
             **scoring_metadata,
         }
