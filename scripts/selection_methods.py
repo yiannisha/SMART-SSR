@@ -574,7 +574,7 @@ def score_pooled_candidates_by_uncertainty_band(
                 "band_min_entropy": band_min_entropy,
                 "band_max_entropy": band_max_entropy,
             }
-    elif selection_mode == "per_task_top_ratio":
+    elif selection_mode in {"per_task_top_ratio", "per_task_top_count"}:
         for source_task, task_candidate_entropies in entropies_by_task.items():
             task_mean_entropies = [item.mean_entropy for item in task_candidate_entropies]
             task_band_min_entropy, task_band_max_entropy = resolve_entropy_band_bounds(
@@ -604,7 +604,7 @@ def score_pooled_candidates_by_uncertainty_band(
     else:
         raise ValueError(
             f"Unknown uncertainty selection mode `{selection_mode}`. "
-            "Available modes: global, per_task_top_ratio"
+            "Available modes: global, per_task_top_ratio, per_task_top_count"
         )
 
     return UncertaintyBandScoringResult(

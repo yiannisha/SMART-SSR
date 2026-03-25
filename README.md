@@ -166,7 +166,7 @@ Notes:
 - The replay runner does not modify `data/dataset_info.json`.
 - `mean_kl` supports `--mean_kl_selection_mode global`, `--mean_kl_selection_mode per_task_top_ratio`, and `--mean_kl_selection_mode per_task_top_count`.
 - `uncertainty_band` supports `--uncertainty_selection_mode global`, `--uncertainty_selection_mode per_task_top_ratio`, and `--uncertainty_selection_mode per_task_top_count`.
-- `--h_min` and `--h_max` are percentile cutoffs in `[0.0, 1.0]`, not raw entropy values. `0.25` / `0.75` means the middle 50% entropy band of the scored candidate set, or of each source task in `per_task_top_ratio` mode.
+- `--h_min` and `--h_max` are percentile cutoffs in `[0.0, 1.0]`, not raw entropy values. `0.25` / `0.75` means the middle 50% entropy band of the scored candidate set, or of each source task in `per_task_top_ratio` / `per_task_top_count` mode.
 - `--per_task_selection_count` applies a fixed cap per prior task when you use a `per_task_top_count` mode. This is the fair-budget option if you want pooled selectors to match the legacy 200-per-task rehearsal budget.
 - The maintained paper-style runner now accepts `--selector` and writes stage-local dataset registries under `<output_root>/stage_data/<stage>/dataset_info.json`.
 - The paper-style runner shares only `raw` and `parsed` artifacts across runs. Checkpoint-dependent `refined` and compatibility `final/cl_queue` artifacts are written under `<output_root>/artifacts/`.
