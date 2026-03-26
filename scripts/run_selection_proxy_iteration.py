@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Mapping
 
 from selection_methods import (
+    HYBRID_CLUSTER_SELECTOR_NAME,
     KMEANS_SELECTOR_N_CLUSTER,
     MEAN_KL_SELECTOR_NAME,
     UNCERTAINTY_BAND_SELECTOR_NAME,
@@ -20,7 +21,9 @@ from selection_methods import (
     load_jsonl,
     normalize_candidate_rows,
     safe_hf_cache_dir,
+    score_pooled_candidates_by_hybrid_cluster,
     select_by_kmeans_score_indices,
+    select_indices_by_cluster_scores,
     score_pooled_candidates_by_mean_kl,
     score_pooled_candidates_by_uncertainty_band,
     select_rows,
@@ -47,7 +50,11 @@ ARTIFACT_KEY_MAP = {
     "refined": "refined_generation_file",
     "final": "rehearsal_file",
 }
-POOLED_SELECTORS = {MEAN_KL_SELECTOR_NAME, UNCERTAINTY_BAND_SELECTOR_NAME}
+POOLED_SELECTORS = {
+    MEAN_KL_SELECTOR_NAME,
+    UNCERTAINTY_BAND_SELECTOR_NAME,
+    HYBRID_CLUSTER_SELECTOR_NAME,
+}
 POOLED_SELECTION_MODES = ("global", "per_task_top_ratio", "per_task_top_count", "per_cluster")
 
 
@@ -304,11 +311,14 @@ def resolve_pooled_selection_mode(
     selector: str,
     mean_kl_selection_mode: str,
     uncertainty_selection_mode: str,
+    hybrid_cluster_selection_mode: str,
 ) -> str:
     if selector == MEAN_KL_SELECTOR_NAME:
         return mean_kl_selection_mode
     if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
         return uncertainty_selection_mode
+    if selector == HYBRID_CLUSTER_SELECTOR_NAME:
+        return hybrid_cluster_selection_mode
     return "global"
 
 
@@ -317,6 +327,8 @@ def pooled_selection_mode_flag(selector: str) -> str:
         return "--mean_kl_selection_mode"
     if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
         return "--uncertainty_selection_mode"
+    if selector == HYBRID_CLUSTER_SELECTOR_NAME:
+        return "--hybrid_cluster_selection_mode"
     raise ValueError(f"Selector `{selector}` is not a pooled selector.")
 
 
@@ -325,6 +337,8 @@ def pooled_selection_mode_field(selector: str) -> str:
         return "mean_kl_selection_mode"
     if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
         return "uncertainty_selection_mode"
+    if selector == HYBRID_CLUSTER_SELECTOR_NAME:
+        return "hybrid_cluster_selection_mode"
     raise ValueError(f"Selector `{selector}` is not a pooled selector.")
 
 
@@ -333,6 +347,8 @@ def pooled_score_field(selector: str) -> str:
         return "mean_kl"
     if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
         return "uncertainty_band_score"
+    if selector == HYBRID_CLUSTER_SELECTOR_NAME:
+        return "hybrid_cluster_score"
     raise ValueError(f"Selector `{selector}` is not a pooled selector.")
 
 
@@ -419,6 +435,9 @@ def run_pooled_selection(
     uncertainty_batch_size: int,
     h_min: float,
     h_max: float,
+    hybrid_cluster_diversity_weight: float,
+    hybrid_cluster_mean_kl_weight: float,
+    hybrid_cluster_uncertainty_weight: float,
 ) -> tuple[Dict[str, Path], Dict[str, Dict[str, object]], Dict[str, object]]:
     pooled_candidates: List[PooledCandidate] = []
     candidate_paths: Dict[str, Path] = {}
@@ -522,6 +541,7 @@ def run_pooled_selection(
 
     score_field = pooled_score_field(selector)
     uncertainty_band_by_task: Dict[str, Dict[str, float]] = {}
+    hybrid_cluster_states: Dict[str, object] = {}
     scoring_metadata: Dict[str, object]
     if selector == MEAN_KL_SELECTOR_NAME:
         scored_candidates = score_pooled_candidates_by_mean_kl(
@@ -564,6 +584,47 @@ def run_pooled_selection(
             "entropy_band_max": uncertainty_result.band_max_entropy,
             "entropy_bands_by_task": uncertainty_band_by_task,
         }
+    elif selector == HYBRID_CLUSTER_SELECTOR_NAME:
+        hybrid_result = score_pooled_candidates_by_hybrid_cluster(
+            model_name_or_path=model_name_or_path,
+            current_checkpoint=previous_checkpoint,
+            pooled_candidates=pooled_candidates,
+            template_name=template,
+            max_source_length=max_source_length,
+            max_target_length=max_target_length,
+            encoder_model_name_or_path=encoder_model_name_or_path,
+            sample_size=sample_memory,
+            seed=seed,
+            h_min=h_min,
+            h_max=h_max,
+            diversity_weight=hybrid_cluster_diversity_weight,
+            mean_kl_weight=hybrid_cluster_mean_kl_weight,
+            uncertainty_weight=hybrid_cluster_uncertainty_weight,
+            kl_batch_size=kl_batch_size,
+            uncertainty_batch_size=uncertainty_batch_size,
+            n_cluster=KMEANS_SELECTOR_N_CLUSTER,
+        )
+        scored_candidates = hybrid_result.scored_candidates
+        uncertainty_band_by_task = {
+            source_task: dict(task_metadata)
+            for source_task, task_metadata in hybrid_result.band_by_source_task.items()
+        }
+        hybrid_cluster_states = dict(hybrid_result.cluster_state_by_source_task)
+        scoring_metadata = {
+            "hybrid_cluster_diversity_weight": hybrid_cluster_diversity_weight,
+            "hybrid_cluster_mean_kl_weight": hybrid_cluster_mean_kl_weight,
+            "hybrid_cluster_uncertainty_weight": hybrid_cluster_uncertainty_weight,
+            "hybrid_cluster_score_normalization": "min_max_per_cluster",
+            "kl_batch_size": kl_batch_size,
+            "uncertainty_batch_size": uncertainty_batch_size,
+            "h_min": h_min,
+            "h_max": h_max,
+            "mean_entropy_min": hybrid_result.entropy_min,
+            "mean_entropy_max": hybrid_result.entropy_max,
+            "entropy_band_min": hybrid_result.band_min_entropy,
+            "entropy_band_max": hybrid_result.band_max_entropy,
+            "entropy_bands_by_task": uncertainty_band_by_task,
+        }
     else:
         raise ValueError(f"Selector `{selector}` is not a pooled selector.")
 
@@ -595,15 +656,27 @@ def run_pooled_selection(
                 float(task_scored_candidates[candidate_index].score)
                 for candidate_index in range(len(task_rows))
             ]
-            selected_indices, cluster_state = select_by_kmeans_score_indices(
-                rows=task_rows,
-                ranking_scores=task_scores,
-                encoder_model_name_or_path=encoder_model_name_or_path,
-                sample_size=sample_memory,
-                seed=seed,
-                n_cluster=KMEANS_SELECTOR_N_CLUSTER,
-                descending=True,
-            )
+            if selector == HYBRID_CLUSTER_SELECTOR_NAME:
+                cluster_state = hybrid_cluster_states.get(source_task)
+                if cluster_state is None:
+                    selected_indices = list(range(min(len(task_rows), sample_memory)))
+                else:
+                    selected_indices = select_indices_by_cluster_scores(
+                        state=cluster_state,
+                        ranking_scores=task_scores,
+                        sample_size=sample_memory,
+                        descending=True,
+                    )
+            else:
+                selected_indices, cluster_state = select_by_kmeans_score_indices(
+                    rows=task_rows,
+                    ranking_scores=task_scores,
+                    encoder_model_name_or_path=encoder_model_name_or_path,
+                    sample_size=sample_memory,
+                    seed=seed,
+                    n_cluster=KMEANS_SELECTOR_N_CLUSTER,
+                    descending=True,
+                )
             selected_rows_by_task[source_task] = [task_rows[idx] for idx in selected_indices]
             selected_scores_by_task[source_task] = [task_scores[idx] for idx in selected_indices]
             selected_counts_by_task[source_task] = len(selected_indices)
@@ -623,7 +696,7 @@ def run_pooled_selection(
                 ),
             }
 
-            if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+            if selector in {UNCERTAINTY_BAND_SELECTOR_NAME, HYBRID_CLUSTER_SELECTOR_NAME}:
                 selected_entropies: List[float] = []
                 for idx in selected_indices:
                     mean_entropy = task_scored_candidates[idx].mean_entropy
@@ -646,7 +719,7 @@ def run_pooled_selection(
             "inputs": candidate.row["inputs"],
             "targets": candidate.row["targets"],
         }
-        if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+        if selector in {UNCERTAINTY_BAND_SELECTOR_NAME, HYBRID_CLUSTER_SELECTOR_NAME}:
             if scored_candidate.mean_entropy is None:
                 raise ValueError("Uncertainty scoring must populate mean entropy.")
             ranked_row["mean_entropy"] = scored_candidate.mean_entropy
@@ -654,6 +727,30 @@ def run_pooled_selection(
             if task_band is not None:
                 ranked_row["entropy_band_min"] = task_band["band_min_entropy"]
                 ranked_row["entropy_band_max"] = task_band["band_max_entropy"]
+        if selector == HYBRID_CLUSTER_SELECTOR_NAME:
+            if (
+                scored_candidate.mean_kl is None
+                or scored_candidate.uncertainty_band_score is None
+                or scored_candidate.diversity_score is None
+                or scored_candidate.normalized_mean_kl is None
+                or scored_candidate.normalized_uncertainty_band_score is None
+                or scored_candidate.normalized_diversity_score is None
+            ):
+                raise ValueError("Hybrid cluster scoring must populate all component scores.")
+            ranked_row.update(
+                {
+                    "mean_kl": scored_candidate.mean_kl,
+                    "uncertainty_band_score": scored_candidate.uncertainty_band_score,
+                    "diversity_score": scored_candidate.diversity_score,
+                    "normalized_mean_kl": scored_candidate.normalized_mean_kl,
+                    "normalized_uncertainty_band_score": (
+                        scored_candidate.normalized_uncertainty_band_score
+                    ),
+                    "normalized_diversity_score": scored_candidate.normalized_diversity_score,
+                    "centroid_distance": scored_candidate.centroid_distance,
+                    "cluster_id": scored_candidate.cluster_id,
+                }
+            )
         if pooled_selection_mode == "per_cluster":
             ranked_row["selected"] = (
                 candidate.source_task,
@@ -673,7 +770,7 @@ def run_pooled_selection(
             selected_rows_by_task[candidate.source_task].append(candidate.row)
             selected_scores_by_task[candidate.source_task].append(score)
             selected_counts_by_task[candidate.source_task] += 1
-            if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+            if selector in {UNCERTAINTY_BAND_SELECTOR_NAME, HYBRID_CLUSTER_SELECTOR_NAME}:
                 assert scored_candidate.mean_entropy is not None
                 selected_entropies_by_task[candidate.source_task].append(scored_candidate.mean_entropy)
 
@@ -714,7 +811,7 @@ def run_pooled_selection(
             f"selected_{score_field}_min": min(chosen_scores) if chosen_scores else None,
             f"selected_{score_field}_max": max(chosen_scores) if chosen_scores else None,
         }
-        if selector == UNCERTAINTY_BAND_SELECTOR_NAME:
+        if selector in {UNCERTAINTY_BAND_SELECTOR_NAME, HYBRID_CLUSTER_SELECTOR_NAME}:
             task_band = uncertainty_band_by_task.get(source_task, {})
             chosen_entropies = selected_entropies_by_task.get(source_task, [])
             selection_metadata[source_task].update(
@@ -784,12 +881,20 @@ def parse_args() -> argparse.Namespace:
         choices=POOLED_SELECTION_MODES,
         default="global",
     )
+    parser.add_argument(
+        "--hybrid_cluster_selection_mode",
+        choices=("per_cluster",),
+        default="per_cluster",
+    )
     parser.add_argument("--per_task_selection_ratio", type=float)
     parser.add_argument("--per_task_selection_count", type=int)
     parser.add_argument("--kl_batch_size", type=int, default=1)
     parser.add_argument("--uncertainty_batch_size", type=int, default=1)
     parser.add_argument("--h_min", "--uncertainty_h_min", dest="h_min", type=float, default=0.25)
     parser.add_argument("--h_max", "--uncertainty_h_max", dest="h_max", type=float, default=0.75)
+    parser.add_argument("--hybrid_cluster_diversity_weight", type=float, default=1.0)
+    parser.add_argument("--hybrid_cluster_mean_kl_weight", type=float, default=1.0)
+    parser.add_argument("--hybrid_cluster_uncertainty_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_source_length", type=int, default=1024)
     parser.add_argument("--max_target_length", type=int, default=512)
@@ -828,6 +933,7 @@ def main() -> None:
         args.selector,
         args.mean_kl_selection_mode,
         args.uncertainty_selection_mode,
+        args.hybrid_cluster_selection_mode,
     )
 
     output_root = (
@@ -886,6 +992,9 @@ def main() -> None:
             uncertainty_batch_size=args.uncertainty_batch_size,
             h_min=args.h_min,
             h_max=args.h_max,
+            hybrid_cluster_diversity_weight=args.hybrid_cluster_diversity_weight,
+            hybrid_cluster_mean_kl_weight=args.hybrid_cluster_mean_kl_weight,
+            hybrid_cluster_uncertainty_weight=args.hybrid_cluster_uncertainty_weight,
         )
     else:
         for source_task in previous_tasks:

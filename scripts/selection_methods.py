@@ -29,6 +29,7 @@ SelectorFn = Callable[["SelectionContext"], "SelectionResult"]
 SELECTORS: Dict[str, SelectorFn] = {}
 MEAN_KL_SELECTOR_NAME = "mean_kl"
 UNCERTAINTY_BAND_SELECTOR_NAME = "uncertainty_band"
+HYBRID_CLUSTER_SELECTOR_NAME = "hybrid_cluster"
 KMEANS_SELECTOR_N_CLUSTER = 20
 
 
@@ -76,6 +77,13 @@ class ScoredCandidate:
     score: float
     mean_kl: float | None = None
     mean_entropy: float | None = None
+    uncertainty_band_score: float | None = None
+    diversity_score: float | None = None
+    normalized_mean_kl: float | None = None
+    normalized_uncertainty_band_score: float | None = None
+    normalized_diversity_score: float | None = None
+    centroid_distance: float | None = None
+    cluster_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +110,17 @@ class KMeansSelectionState:
     centroid_distances: np.ndarray
     counts: np.ndarray
     allocations: np.ndarray
+
+
+@dataclass(frozen=True)
+class HybridClusterScoringResult:
+    scored_candidates: List[ScoredCandidate]
+    entropy_min: float | None
+    entropy_max: float | None
+    band_min_entropy: float | None
+    band_max_entropy: float | None
+    band_by_source_task: Mapping[str, Dict[str, float]]
+    cluster_state_by_source_task: Mapping[str, KMeansSelectionState | None]
 
 
 def register_selector(name: str) -> Callable[[SelectorFn], SelectorFn]:
@@ -377,6 +396,46 @@ def uncertainty_band_score(
     return torch.clamp(score, min=0.0, max=1.0)
 
 
+def min_max_scale(values: np.ndarray, invert: bool = False) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return values.astype(np.float32, copy=False)
+
+    minimum = float(np.min(values))
+    maximum = float(np.max(values))
+    span = maximum - minimum
+    if span <= 1e-12:
+        return np.ones_like(values, dtype=np.float64)
+
+    if invert:
+        scaled = (maximum - values) / span
+    else:
+        scaled = (values - minimum) / span
+    return np.clip(scaled, 0.0, 1.0)
+
+
+def min_max_scale_by_cluster(
+    labels: np.ndarray,
+    values: np.ndarray,
+    invert: bool = False,
+) -> np.ndarray:
+    labels = np.asarray(labels)
+    values = np.asarray(values, dtype=np.float64)
+    if labels.shape[0] != values.shape[0]:
+        raise ValueError("Cluster labels and values must align.")
+
+    scaled = np.zeros_like(values, dtype=np.float64)
+    if values.size == 0:
+        return scaled
+
+    for cluster_id in np.unique(labels):
+        cluster_indices = np.where(labels == cluster_id)[0]
+        if cluster_indices.size == 0:
+            continue
+        scaled[cluster_indices] = min_max_scale(values[cluster_indices], invert=invert)
+    return scaled
+
+
 def score_pooled_candidates_by_mean_kl(
     model_name_or_path: str,
     current_checkpoint: Path,
@@ -580,6 +639,7 @@ def score_pooled_candidates_by_uncertainty_band(
                     candidate=candidate_entropy.candidate,
                     score=float(score),
                     mean_entropy=candidate_entropy.mean_entropy,
+                    uncertainty_band_score=float(score),
                 )
             )
         for source_task, task_candidate_entropies in entropies_by_task.items():
@@ -615,6 +675,7 @@ def score_pooled_candidates_by_uncertainty_band(
                         candidate=candidate_entropy.candidate,
                         score=float(score),
                         mean_entropy=candidate_entropy.mean_entropy,
+                        uncertainty_band_score=float(score),
                     )
                 )
     else:
@@ -630,6 +691,181 @@ def score_pooled_candidates_by_uncertainty_band(
         band_min_entropy=band_min_entropy,
         band_max_entropy=band_max_entropy,
         band_by_source_task=band_by_source_task,
+    )
+
+
+def score_pooled_candidates_by_hybrid_cluster(
+    model_name_or_path: str,
+    current_checkpoint: Path,
+    pooled_candidates: List[PooledCandidate],
+    template_name: str,
+    max_source_length: int,
+    max_target_length: int,
+    encoder_model_name_or_path: str,
+    sample_size: int,
+    seed: int,
+    h_min: float,
+    h_max: float,
+    diversity_weight: float,
+    mean_kl_weight: float,
+    uncertainty_weight: float,
+    kl_batch_size: int = 1,
+    uncertainty_batch_size: int = 1,
+    n_cluster: int = KMEANS_SELECTOR_N_CLUSTER,
+) -> HybridClusterScoringResult:
+    if sample_size <= 0:
+        raise ValueError("Hybrid cluster selection requires a positive sample size.")
+    if abs(diversity_weight) + abs(mean_kl_weight) + abs(uncertainty_weight) <= 1e-12:
+        raise ValueError("At least one hybrid cluster weight must be non-zero.")
+    if not pooled_candidates:
+        return HybridClusterScoringResult(
+            scored_candidates=[],
+            entropy_min=None,
+            entropy_max=None,
+            band_min_entropy=None,
+            band_max_entropy=None,
+            band_by_source_task={},
+            cluster_state_by_source_task={},
+        )
+
+    mean_kl_candidates = score_pooled_candidates_by_mean_kl(
+        model_name_or_path=model_name_or_path,
+        current_checkpoint=current_checkpoint,
+        pooled_candidates=pooled_candidates,
+        template_name=template_name,
+        max_source_length=max_source_length,
+        max_target_length=max_target_length,
+        batch_size=kl_batch_size,
+    )
+    uncertainty_result = score_pooled_candidates_by_uncertainty_band(
+        model_name_or_path=model_name_or_path,
+        current_checkpoint=current_checkpoint,
+        pooled_candidates=pooled_candidates,
+        template_name=template_name,
+        max_source_length=max_source_length,
+        max_target_length=max_target_length,
+        selection_mode="per_cluster",
+        h_min=h_min,
+        h_max=h_max,
+        batch_size=uncertainty_batch_size,
+    )
+
+    mean_kl_by_candidate: Dict[tuple[str, int], ScoredCandidate] = {}
+    for scored_candidate in mean_kl_candidates:
+        candidate = scored_candidate.candidate
+        mean_kl_by_candidate[(candidate.source_task, candidate.candidate_index)] = scored_candidate
+
+    uncertainty_by_candidate: Dict[tuple[str, int], ScoredCandidate] = {}
+    pooled_candidates_by_task: Dict[str, List[PooledCandidate]] = {}
+    for scored_candidate in uncertainty_result.scored_candidates:
+        candidate = scored_candidate.candidate
+        uncertainty_by_candidate[(candidate.source_task, candidate.candidate_index)] = scored_candidate
+        pooled_candidates_by_task.setdefault(candidate.source_task, []).append(candidate)
+
+    for task_candidates in pooled_candidates_by_task.values():
+        task_candidates.sort(key=lambda candidate: candidate.candidate_index)
+
+    cluster_state_by_source_task: Dict[str, KMeansSelectionState | None] = {}
+    combined_candidates: List[ScoredCandidate] = []
+
+    for source_task, task_candidates in pooled_candidates_by_task.items():
+        task_rows = [candidate.row for candidate in task_candidates]
+        if len(task_candidates) > sample_size:
+            task_embeddings = encode_texts(
+                [row["inputs"] for row in task_rows],
+                encoder_model_name_or_path,
+            )
+            cluster_state = build_kmeans_selection_state(
+                embeddings=task_embeddings,
+                sample_size=sample_size,
+                n_cluster=n_cluster,
+                seed=seed,
+            )
+        else:
+            cluster_state = None
+        cluster_state_by_source_task[source_task] = cluster_state
+
+        raw_kl_scores: List[float] = []
+        raw_uncertainty_scores: List[float] = []
+        mean_entropies: List[float] = []
+        for candidate in task_candidates:
+            candidate_key = (candidate.source_task, candidate.candidate_index)
+            mean_kl_candidate = mean_kl_by_candidate.get(candidate_key)
+            uncertainty_candidate = uncertainty_by_candidate.get(candidate_key)
+            if mean_kl_candidate is None or mean_kl_candidate.mean_kl is None:
+                raise ValueError(
+                    f"Hybrid cluster scoring is missing a KL score for task `{source_task}` "
+                    f"candidate index {candidate.candidate_index}."
+                )
+            if (
+                uncertainty_candidate is None
+                or uncertainty_candidate.uncertainty_band_score is None
+                or uncertainty_candidate.mean_entropy is None
+            ):
+                raise ValueError(
+                    f"Hybrid cluster scoring is missing an uncertainty score for task `{source_task}` "
+                    f"candidate index {candidate.candidate_index}."
+                )
+            raw_kl_scores.append(float(mean_kl_candidate.mean_kl))
+            raw_uncertainty_scores.append(float(uncertainty_candidate.uncertainty_band_score))
+            mean_entropies.append(float(uncertainty_candidate.mean_entropy))
+
+        raw_kl_scores_np = np.asarray(raw_kl_scores, dtype=np.float64)
+        raw_uncertainty_scores_np = np.asarray(raw_uncertainty_scores, dtype=np.float64)
+
+        if cluster_state is None:
+            labels = np.zeros(len(task_candidates), dtype=np.int64)
+            centroid_distances = np.zeros(len(task_candidates), dtype=np.float64)
+        else:
+            labels = cluster_state.labels
+            centroid_distances = cluster_state.centroid_distances.astype(np.float64, copy=False)
+
+        diversity_scores = min_max_scale_by_cluster(
+            labels=labels,
+            values=centroid_distances,
+            invert=True,
+        )
+        normalized_kl_scores = min_max_scale_by_cluster(
+            labels=labels,
+            values=raw_kl_scores_np,
+            invert=False,
+        )
+        normalized_uncertainty_scores = min_max_scale_by_cluster(
+            labels=labels,
+            values=raw_uncertainty_scores_np,
+            invert=False,
+        )
+        final_scores = (
+            diversity_weight * diversity_scores
+            + mean_kl_weight * normalized_kl_scores
+            + uncertainty_weight * normalized_uncertainty_scores
+        )
+
+        for idx, candidate in enumerate(task_candidates):
+            combined_candidates.append(
+                ScoredCandidate(
+                    candidate=candidate,
+                    score=float(final_scores[idx]),
+                    mean_kl=float(raw_kl_scores_np[idx]),
+                    mean_entropy=float(mean_entropies[idx]),
+                    uncertainty_band_score=float(raw_uncertainty_scores_np[idx]),
+                    diversity_score=float(diversity_scores[idx]),
+                    normalized_mean_kl=float(normalized_kl_scores[idx]),
+                    normalized_uncertainty_band_score=float(normalized_uncertainty_scores[idx]),
+                    normalized_diversity_score=float(diversity_scores[idx]),
+                    centroid_distance=float(centroid_distances[idx]),
+                    cluster_id=int(labels[idx]),
+                )
+            )
+
+    return HybridClusterScoringResult(
+        scored_candidates=sorted(combined_candidates, key=lambda candidate: candidate.score, reverse=True),
+        entropy_min=uncertainty_result.entropy_min,
+        entropy_max=uncertainty_result.entropy_max,
+        band_min_entropy=uncertainty_result.band_min_entropy,
+        band_max_entropy=uncertainty_result.band_max_entropy,
+        band_by_source_task=uncertainty_result.band_by_source_task,
+        cluster_state_by_source_task=cluster_state_by_source_task,
     )
 
 

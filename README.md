@@ -96,6 +96,7 @@ Built-in selectors exposed by the maintained runners:
 - `kmeans`
 - `mean_kl`
 - `uncertainty_band`
+- `hybrid_cluster`
 
 Each selector receives a `SelectionContext` with:
 
@@ -166,7 +167,9 @@ Notes:
 - The replay runner does not modify `data/dataset_info.json`.
 - `mean_kl` supports `--mean_kl_selection_mode global`, `--mean_kl_selection_mode per_task_top_ratio`, `--mean_kl_selection_mode per_task_top_count`, and `--mean_kl_selection_mode per_cluster`.
 - `uncertainty_band` supports `--uncertainty_selection_mode global`, `--uncertainty_selection_mode per_task_top_ratio`, `--uncertainty_selection_mode per_task_top_count`, and `--uncertainty_selection_mode per_cluster`.
-- `per_cluster` clusters each source task candidate pool with the maintained k-means selector path, keeps the same per-cluster quotas as `kmeans`, and changes only the within-cluster ranking signal (`mean_kl` or `uncertainty_band_score`).
+- `hybrid_cluster` is a weighted per-cluster selector. It reuses the maintained k-means clustering path, computes a centroid-closeness diversity score plus `mean_kl` and `uncertainty_band_score`, min-max normalizes the three scores within each cluster, and ranks by the weighted sum.
+- Tune `hybrid_cluster` with `--hybrid_cluster_diversity_weight`, `--hybrid_cluster_mean_kl_weight`, and `--hybrid_cluster_uncertainty_weight`. `--hybrid_cluster_selection_mode` is fixed to `per_cluster`.
+- `per_cluster` clusters each source task candidate pool with the maintained k-means selector path, keeps the same per-cluster quotas as `kmeans`, and changes only the within-cluster ranking signal (`mean_kl`, `uncertainty_band_score`, or the weighted `hybrid_cluster` score).
 - `--h_min` and `--h_max` are percentile cutoffs in `[0.0, 1.0]`, not raw entropy values. `0.25` / `0.75` means the middle 50% entropy band of the scored candidate set, or of each source task in `per_task_top_ratio` / `per_task_top_count` / `per_cluster` mode.
 - `--per_task_selection_count` applies a fixed cap per prior task when you use a `per_task_top_count` mode. This is the fair-budget option if you want pooled selectors to match the legacy 200-per-task rehearsal budget.
 - The maintained paper-style runner now accepts `--selector` and writes stage-local dataset registries under `<output_root>/stage_data/<stage>/dataset_info.json`.
