@@ -1,437 +1,327 @@
-# SMART-SSR-CL Guide
+# SMART-SSR Fresh Setup Guide
 
-This workspace contains the SSR research code at the repository root.
-It is a fork/extension of LLaMA-Efficient-Tuning (LLaMA-Factory style) for continual learning experiments from the ACL 2024 SSR paper.
+This guide is for the repository in its current state and focuses on the maintained path for a full 5-task SSR run with `meta-llama/Llama-2-7b-chat-hf` and the `hybrid_cluster` selector.
 
-## 1) What this codebase is
+Use the maintained runners in `scripts/`. Do not start from the historical shell scripts under `src/scripts-ni-c012/`; many of those still assume old absolute paths.
 
-Core training runner:
-- `src/train_bash.py` -> calls `llmtuner.run_exp()`
-- `src/llmtuner/tuner/tune.py` dispatches by `--stage`
+## What this guide covers
 
-Supported stages in this fork:
-- `pt` (pretraining)
-- `sft` (supervised fine-tuning)
-- `sftrp` (SFT-style predict/eval used heavily for CL evaluation)
-- `sftreg` (regularization CL: EWC/L2)
-- `rm`, `ppo`, `dpo` (inherited from upstream framework)
+- fresh environment setup from the repo root
+- gated Hugging Face access for `meta-llama/Llama-2-7b-chat-hf`
+- the maintained paper-style 5-task SSR pipeline
+- hybrid rehearsal selection with explicit weight control
+- resume behavior and where outputs land
 
-SSR-specific additions live in:
-- `custom/icl_gen/` (synthetic instance generation + labeling)
-- `custom/niv2-c012/` (SuperNI filtering/splitting/KMeans subset creation)
-- `src/scripts-ni-c012/` (original experiment shell scripts)
-- `scripts/run_basic_ssr_5task.py` and `scripts/run_basic_ssr_5task.sh` (working 5-task SSR runner in this workspace)
-- `scripts/run_paper_ssr_5task.py` (paper-style artifact pipeline)
-- `scripts/selection_methods.py` (selector registry for replay experiments)
-- `scripts/run_selection_proxy_iteration.py` (single-iteration selector replay)
+## Repo assumptions
 
-## 2) What experiments are supported
+The maintained paper runner uses the default 5-task queue:
 
-### A. Continual learning on SuperNI categories (`ni-cus0.12`)
-Task categories used in scripts:
-- 10-task setup: `qa qg sa sum trans dsg expl para pe pos`
-- 5-task setup: first five only (`qa qg sa sum trans`)
-
-Experiment families (main paper-style):
-- Single-task start (stage-1 CL init): `lora/sing/...`
-- Non-rehearsal CL: `lora/cl...` with `cl_queue`
-- RandSel rehearsal: scripts with `_rp`
-- KMeansSel rehearsal: scripts with `_km20_rp`
-- SSR rehearsal (self-synthesized + refined): scripts with `_iclgen_self`
-- Queue variants: `cl`, `cl2`, `cl3` (different task orders / queues)
-
-Representative script paths:
-- Non-rehearsal: `src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue.3ep.bs32x1x1.lr2e-04.bf16.sh`
-- RandSel: `src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_rp.3ep.bs32x1x1.lr2e-04.bf16.sh`
-- KMeansSel: `src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_km20_rp.3ep.bs32x1x1.lr2e-04.bf16.sh`
-- SSR: `src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_iclgen_self.3ep.bs32x1x1.lr2e-04.bf16.sh`
-
-### B. Multi-task (joint) baselines
-- `lora/all/...all...sh` (all categories)
-- `lora/all/...all_5...sh` (5-category subset)
-
-### C. Regularization-based CL baselines
-- `--stage sftreg` with `--reg_cl_method ewc|l2`
-- Example scripts in:
-  - `src/scripts-ni-c012/lora/cl/llama2-7b-reg/`
-
-### D. Synthetic data generation pipeline (SSR data creation)
-Pipeline in README and custom scripts:
-1. Generate ICL synthetic instances:
-   - `custom/icl_gen/complete_param_nic010_cate.py`
-2. Parse/filter generated outputs:
-   - `custom/icl_gen/parse_filter_generated.py` (or alpaca variant scripts)
-3. Refine synthetic outputs with current checkpoint:
-   - `custom/icl_gen/label_param.py`
-4. Select rehearsal subset from the refined outputs:
-   - Legacy random selector: `custom/icl_gen/random_select.py`
-   - Legacy KMeans selector: `custom/icl_gen/kmeans_self.py`
-   - Replay/dev selector path: `scripts/selection_methods.py` plus `scripts/run_selection_proxy_iteration.py`
-
-The maintained paper-style runner shares only `raw` and `parsed` artifacts across runs. Checkpoint-dependent `refined` and compatibility `cl_queue` artifacts are run-local, so selector comparisons do not silently reuse another run's refined data.
-
-### E. Additional evaluation workflows
-- CL eval in main scripts uses `--stage sftrp` and writes:
-  - `all_results.json`
-  - `generated_predictions.jsonl`
-- MMLU:
-  - `mmlu_test/evaluate_causal.py`
-  - demo: `mmlu_test/mmlu_demo.sh`
-- AlpacaEval helper:
-  - `custom/alpaca_eval/alpaca_demo.sh`
-
-## 3) Before running: critical path fixes
-
-Most provided `.sh` scripts are hardcoded to old absolute paths like `/home/hjh/data/public/SSR`.
-You must edit at least these variables in each script you use:
-- `REPO_ROOT_DIR`
-- `SRC_DIR`
-- `MODEL_DIR`
-- any hardcoded data output paths
-
-For this workspace, prefer the maintained wrapper instead of patching every historical script:
-- `bash scripts/run_basic_ssr_5task.sh ...`
-- `python scripts/run_paper_ssr_5task.py ...`
-- `python scripts/run_selection_proxy_iteration.py ...` for selector replay against existing artifacts
-
-The working wrapper already handles:
-- sourcing `keys.sh` if present
-- bootstrapping `.venv` through `scripts/bootstrap_env.sh`
-- training the 5-task queue `qa qg sa sum trans`
-- building synthetic rehearsal files for each completed task
-- evaluating each checkpoint on all tasks seen so far
-
-Compatibility fixes already applied in this repo for the maintained path:
-- lazy imports in `src/llmtuner/__init__.py` so Python 3.12 can train without importing the old FastAPI stack
-- local JSON dataset loading fix in `src/llmtuner/dsets/loader.py`
-- `accelerate<1.0.0` pin in `requirements.txt` for compatibility with `transformers==4.36.0`
-- CUDA 12.1 torch bootstrap in `scripts/bootstrap_env.sh` so this workspace uses a driver-compatible GPU build
-
-## 4) Environment setup
-
-```bash
-cd /workspace/SMART-SSR
-python -m venv .venv
-source .venv/bin/activate
-source keys.sh
-pip install -U pip setuptools wheel
-pip install -r requirements.txt
-pip install -e .
+```text
+qa qg sa sum trans
 ```
 
-Notes:
-- Default scripts use `--bf16 True`; you need BF16-capable GPU.
-- If BF16 unsupported, switch scripts/commands to `--fp16 True` and remove `--bf16 True`.
+For each stage it does the following:
 
-## 5) Fastest working end-to-end run in this workspace
+1. generate raw synthetic candidates
+2. parse and filter them
+3. train the current task, with rehearsal after stage 1
+4. refine that task's synthetic outputs with the current checkpoint
+5. write a compatibility k-means rehearsal artifact
+6. evaluate the current checkpoint on all tasks
+
+Important details from the current code:
+
+- `scripts/run_paper_ssr_5task_llama2_7b_chat.sh` is the simplest entrypoint for `llama2-7b-chat`
+- that wrapper auto-sources `keys.sh` if present
+- it auto-runs `scripts/bootstrap_env.sh`
+- the bootstrap creates `.venv`, installs a CUDA 12.1 PyTorch build, installs `requirements.txt`, and installs the repo editable
+- training and evaluation currently pass `--bf16 True`, so the maintained path assumes a BF16-capable GPU
+
+## 1. Fresh setup
+
+Start from the repository root:
 
 ```bash
-cd /workspace/SMART-SSR
-source .venv/bin/activate
-source keys.sh
-
-bash scripts/run_basic_ssr_5task.sh \
-  --model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --output_root saves/basic-ssr-5task \
-  --train_max_steps 2 \
-  --train_max_samples 10 \
-  --eval_max_samples 2 \
-  --prompts_per_group 2 \
-  --max_candidates 5 \
-  --synthesis_max_new_tokens 64 \
-  --refine_max_new_tokens 64
+cd /path/to/SMART-SSR
 ```
 
-Outputs:
-- checkpoints: `saves/basic-ssr-5task/01_qa` ... `saves/basic-ssr-5task/05_trans`
-- final summary: `saves/basic-ssr-5task/run_summary.json`
-- rehearsal files for the default TinyLlama example: `data/ni-cus0.12/genearated-icl-naive-kmeans20-self/tinyllama/cl_queue/*.json`
+### 1.1 Optional: provide a Hugging Face token
 
-To resume after interruption:
+`meta-llama/Llama-2-7b-chat-hf` is gated. You need approval for that model on Hugging Face.
+
+The maintained shell wrapper looks for `keys.sh` and maps `HUGGING_FACE_ACCESS_TOKEN` into `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN`.
+
+Minimal `keys.sh`:
 
 ```bash
-bash scripts/run_basic_ssr_5task.sh \
-  --model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --output_root saves/basic-ssr-5task \
-  --train_max_steps 2 \
-  --train_max_samples 10 \
-  --eval_max_samples 2 \
-  --prompts_per_group 2 \
-  --max_candidates 5 \
-  --synthesis_max_new_tokens 64 \
-  --refine_max_new_tokens 64 \
+export HUGGING_FACE_ACCESS_TOKEN=hf_xxx
+```
+
+If you do not want a `keys.sh`, exporting the token in your shell is also fine:
+
+```bash
+export HUGGING_FACE_ACCESS_TOKEN=hf_xxx
+```
+
+### 1.2 Bootstrap the environment
+
+```bash
+bash scripts/bootstrap_env.sh
+source .venv/bin/activate
+```
+
+What this does now:
+
+- creates `.venv` if it does not exist
+- installs `torch==2.4.1` from the CUDA 12.1 index
+- installs the repo dependencies
+- installs the package with `pip install -e .`
+
+### 1.3 Optional sanity checks
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.is_bf16_supported())"
+python -c "import transformers, peft, trl; print(transformers.__version__)"
+```
+
+If `torch.cuda.is_bf16_supported()` prints `False`, the maintained paper runner will need code changes before it can run on that machine because the train/eval commands are hardcoded to BF16.
+
+## 2. The maintained 5-task runner
+
+The entrypoints you should use are:
+
+- shell wrapper: `scripts/run_paper_ssr_5task_llama2_7b_chat.sh`
+- Python driver: `scripts/run_paper_ssr_5task.py`
+
+The wrapper expands to:
+
+```bash
+bash scripts/run_paper_ssr_5task.sh \
+  --model_name_or_path meta-llama/Llama-2-7b-chat-hf \
+  --model_family llama2-7b-chat \
+  --output_root saves/paper-ssr-5task-llama2-7b-chat \
+  ...
+```
+
+For a new experiment, always give a fresh `--output_root`.
+
+## 3. Full 5-task SSR run with `hybrid_cluster`
+
+### 3.1 Recommended command
+
+This is the cleanest full run command for the current repo:
+
+```bash
+cd /path/to/SMART-SSR
+
+bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh \
+  --cuda 0 \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --sample_memory 200 \
+  --hybrid_cluster_diversity_weight 1.0 \
+  --hybrid_cluster_mean_kl_weight 1.0 \
+  --hybrid_cluster_uncertainty_weight 1.0 \
+  --output_root saves/paper-ssr-5task-llama2-7b-chat-hybrid-cluster-eq
+```
+
+That runs the full default task order:
+
+```text
+qa -> qg -> sa -> sum -> trans
+```
+
+### 3.2 Example with custom weights
+
+If you want the weighted mix used in this repo's saved experiments:
+
+```bash
+bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh \
+  --cuda 0 \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --sample_memory 200 \
+  --hybrid_cluster_diversity_weight 2.0 \
+  --hybrid_cluster_mean_kl_weight 6.0 \
+  --hybrid_cluster_uncertainty_weight 2.0 \
+  --output_root saves/paper-ssr-5task-llama2-7b-chat-hybrid-cluster-2-6-2
+```
+
+Another valid variant:
+
+```bash
+bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh \
+  --cuda 0 \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --sample_memory 200 \
+  --hybrid_cluster_diversity_weight 2.0 \
+  --hybrid_cluster_mean_kl_weight 2.0 \
+  --hybrid_cluster_uncertainty_weight 6.0 \
+  --output_root saves/paper-ssr-5task-llama2-7b-chat-hybrid-cluster-2-2-6
+```
+
+## 4. How the hybrid selector works in this repo
+
+`hybrid_cluster` is a pooled selector with a fixed selection mode:
+
+```text
+--hybrid_cluster_selection_mode per_cluster
+```
+
+You do not need to pass that flag manually because it is the only supported mode for `hybrid_cluster`.
+
+The current implementation:
+
+- clusters each prior task's candidate pool with the maintained k-means path
+- computes three signals for each candidate:
+  - diversity
+  - `mean_kl`
+  - `uncertainty_band_score`
+- min-max normalizes those signals within each cluster
+- ranks candidates by the weighted sum of those normalized scores
+- keeps the same per-cluster quota structure as the maintained k-means selection path
+
+The weight flags are:
+
+- `--hybrid_cluster_diversity_weight`
+- `--hybrid_cluster_mean_kl_weight`
+- `--hybrid_cluster_uncertainty_weight`
+
+### Budget semantics
+
+For `hybrid_cluster`, `sample_memory` is the important budget flag.
+
+With:
+
+```bash
+--sample_memory 200
+```
+
+the runner selects up to 200 rehearsal examples per previous task at each stage, subject to candidate availability. Because `hybrid_cluster` is fixed to `per_cluster`, these flags do not apply here:
+
+- `--global_selection_count`
+- `--global_selection_ratio`
+- `--per_task_selection_ratio`
+- `--per_task_selection_count`
+
+### Candidate source
+
+For `hybrid_cluster`, use:
+
+```bash
+--candidate_source refined
+```
+
+That makes the selector score the checkpoint-refined candidate pool. In the current runner, `hybrid_cluster` defaults to `refined` if `--candidate_source` is omitted, but it is better to pass it explicitly.
+
+## 5. Outputs to expect
+
+For an output root like:
+
+```text
+saves/paper-ssr-5task-llama2-7b-chat-hybrid-cluster-2-6-2
+```
+
+you should expect:
+
+- checkpoints:
+  - `.../01_qa`
+  - `.../02_qg`
+  - `.../03_sa`
+  - `.../04_sum`
+  - `.../05_trans`
+- stage-local dataset registries:
+  - `.../stage_data/01_qa/dataset_info.json`
+  - `.../stage_data/02_qg/dataset_info.json`
+  - etc.
+- selected rehearsal subsets per stage:
+  - `.../stage_data/02_qg/rehearsal/*.jsonl`
+  - `.../stage_data/03_sa/rehearsal/*.jsonl`
+  - etc.
+- ranked hybrid scores per stage:
+  - `.../stage_data/02_qg/hybrid_cluster_scores.refined.jsonl`
+  - `.../stage_data/03_sa/hybrid_cluster_scores.refined.jsonl`
+  - etc.
+- run-local refined artifacts:
+  - `.../artifacts/refined/*.json`
+- run-local compatibility k-means artifacts:
+  - `.../artifacts/cl_queue/*.json`
+- run summaries:
+  - `.../run_summary.json`
+  - `.../aggregate_metrics.json`
+
+Shared raw and parsed generation artifacts are stored under:
+
+- `data/ni-cus0.12/genearated-icl-naive/llama2-7b-chat/ori-van/`
+- `data/ni-cus0.12/genearated-icl-naive-parsed-filtered/llama2-7b-chat/ori-van/`
+
+Refined and final artifacts are run-local under the selected `output_root`.
+
+## 6. Resume an interrupted run
+
+Use the exact same command and add `--skip_completed`:
+
+```bash
+bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh \
+  --cuda 0 \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --sample_memory 200 \
+  --hybrid_cluster_diversity_weight 2.0 \
+  --hybrid_cluster_mean_kl_weight 6.0 \
+  --hybrid_cluster_uncertainty_weight 2.0 \
+  --output_root saves/paper-ssr-5task-llama2-7b-chat-hybrid-cluster-2-6-2 \
   --skip_completed
 ```
 
-### Paper-style full run with selector control
+`--skip_completed` skips stages whose checkpoint directory already exists.
 
-Use `scripts/run_paper_ssr_5task.py` when you want the maintained artifact pipeline (`raw -> parsed -> refined`) plus selector-controlled rehearsal for training.
+## 7. Optional: direct Python invocation
 
-Example full run for `llama2-7b-chat` with pooled KL selection:
+If you want the same run without the wrapper:
 
 ```bash
-cd /workspace/SMART-SSR
 source .venv/bin/activate
-source keys.sh
 
 python scripts/run_paper_ssr_5task.py \
   --model_name_or_path meta-llama/Llama-2-7b-chat-hf \
   --model_family llama2-7b-chat \
-  --selector mean_kl \
+  --cuda 0 \
+  --selector hybrid_cluster \
   --candidate_source refined \
-  --output_root saves/paper-ssr-5task-llama2-7b-chat-mean-kl \
-  --cuda 0
+  --sample_memory 200 \
+  --hybrid_cluster_diversity_weight 2.0 \
+  --hybrid_cluster_mean_kl_weight 6.0 \
+  --hybrid_cluster_uncertainty_weight 2.0 \
+  --output_root saves/paper-ssr-5task-llama2-7b-chat-hybrid-cluster-2-6-2
 ```
 
-The shortest paper-style command for this repo is now:
+The shell wrapper is still the safer default because it handles token loading and environment bootstrap.
 
-```bash
-bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh
-```
+## 8. Optional data-prep note
 
-Use the same launcher with extra flags to change selector or resume:
+The paper-style runner does not require `PREPARE_EXPERIMENT_DATA=1` for the normal 5-task hybrid run.
 
-```bash
-bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh \
-  --selector mean_kl \
-  --candidate_source refined \
-  --skip_completed
-```
+That switch exists only if you want the wrapper to regenerate the `split-kmeans20` helper subsets through `scripts/prepare_experiment_data.py`.
 
-Outputs:
-- checkpoints: `<output_root>/01_qa` ... `<output_root>/05_trans`
-- per-stage dataset registries and selected rehearsal files: `<output_root>/stage_data/<stage>/`
-- run-local checkpoint-dependent artifacts: `<output_root>/artifacts/refined/` and `<output_root>/artifacts/cl_queue/`
-- run summary: `<output_root>/run_summary.json`
-- aggregate metrics: `<output_root>/aggregate_metrics.json`
-- shared reusable generation artifacts: `data/ni-cus0.12/genearated-icl-naive/{model_family}/ori-van/*.json` and `data/ni-cus0.12/genearated-icl-naive-parsed-filtered/{model_family}/ori-van/*.json`
+## 9. Troubleshooting
 
-### Selector development / single-iteration replay
+### Hugging Face permission error
 
-Use `scripts/run_selection_proxy_iteration.py` when you already have a base SSR run with checkpoints, generated artifacts and `run_summary.json`, and you want to test a different selector on one intermediate stage without regenerating all data.
+If the run fails while resolving `meta-llama/Llama-2-7b-chat-hf`:
 
-Built-in selectors exposed by the maintained runners:
-- `head`
-- `random`
-- `kmeans`
-- `mean_kl`
-- `uncertainty_band`
-- `hybrid_cluster`
+- confirm the account has accepted the model license
+- confirm `HUGGING_FACE_ACCESS_TOKEN` is exported before starting the wrapper
 
-Selector context includes:
-- source task and target task
-- source task index and source checkpoint
-- checkpoint history before the replay target stage
-- candidate artifact path plus normalized candidate rows
+### BF16 / GPU error
 
-Example:
+The maintained runner currently uses BF16 in train and eval commands. If the machine cannot run BF16, the maintained path will fail until those calls are patched.
 
-```bash
-cd /workspace/SMART-SSR
-source .venv/bin/activate
+### Reusing an old output root
 
-python scripts/run_selection_proxy_iteration.py \
-  --base_run saves/paper-ssr-5task-tinyllama \
-  --model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --template llama2 \
-  --iteration_task qg \
-  --selector random \
-  --candidate_source refined \
-  --output_root saves/selection-proxy-tinyllama-qg-random \
-  --train_max_steps 50 \
-  --eval_max_samples 50
-```
+If you reuse an existing `--output_root` without `--skip_completed`, the runner may retrain stages and refresh run-local `refined` and `final` artifacts. Use a new output root for clean experiments.
 
-Replay outputs:
-- selected rehearsal subsets in `<output_root>/proxy_data/rehearsal/*.jsonl`
-- experiment-local dataset registry in `<output_root>/proxy_data/dataset_info.json`
-- replayed checkpoint and eval outputs under `<output_root>/<stage_name>/`
-- `<output_root>/run_summary.json`
-- `<output_root>/proxy_metrics.json`
+### Historical scripts vs maintained runner
 
-Notes:
-- `--candidate_source` accepts `raw`, `parsed`, `refined` or `final`.
-- `--skip_train --skip_eval` materializes only the selected rehearsal subsets.
-- The replay runner uses an experiment-local `dataset_info.json` and does not modify `data/dataset_info.json`.
-- `mean_kl` supports `--mean_kl_selection_mode global`, `--mean_kl_selection_mode per_task_top_ratio`, `--mean_kl_selection_mode per_task_top_count`, and `--mean_kl_selection_mode per_cluster`.
-- `uncertainty_band` supports `--uncertainty_selection_mode global`, `--uncertainty_selection_mode per_task_top_ratio`, `--uncertainty_selection_mode per_task_top_count`, and `--uncertainty_selection_mode per_cluster`.
-- `hybrid_cluster` is a weighted per-cluster selector. It reuses the maintained k-means clustering path, computes centroid-closeness diversity plus `mean_kl` and `uncertainty_band_score`, min-max normalizes the three scores within each cluster, and ranks by the weighted sum.
-- Tune `hybrid_cluster` with `--hybrid_cluster_diversity_weight`, `--hybrid_cluster_mean_kl_weight`, and `--hybrid_cluster_uncertainty_weight`. `--hybrid_cluster_selection_mode` is fixed to `per_cluster`.
-- `per_cluster` clusters each source task candidate pool with the maintained k-means selector path, keeps the same per-cluster quotas as `kmeans`, and changes only the within-cluster ranking signal (`mean_kl`, `uncertainty_band_score`, or the weighted `hybrid_cluster` score).
-- `--h_min` and `--h_max` are percentile cutoffs in `[0.0, 1.0]`, not raw entropy values. `0.25` / `0.75` means the middle 50% entropy band of the scored candidate set, or of each source task in `per_task_top_ratio` / `per_task_top_count` / `per_cluster` mode.
-- `--per_task_selection_count` applies a fixed cap per prior task when you use a `per_task_top_count` mode. This is the fair-budget option if you want pooled selectors to match the legacy 200-per-task rehearsal budget.
-- Use the replay path for fast selector iteration; the full paper-style runner now accepts `--selector` and writes stage-local training inputs under `<output_root>/stage_data/<stage>/`.
-- If you rerun the same paper-style `output_root` without `--skip_completed`, the runner refreshes `refined` and `final` for any retrained stage.
-
-## 6) Minimal way to run core CL experiments manually
-
-### Step 1: train the first task checkpoint (required)
-
-```bash
-cd /workspace/SMART-SSR
-CUDA_VISIBLE_DEVICES=0 python src/train_bash.py \
-  --stage sft \
-  --model_name_or_path /path/to/base/model \
-  --do_train True \
-  --overwrite_cache True \
-  --finetuning_type lora \
-  --template llama2 \
-  --dataset_dir data \
-  --dataset ni_c012_qa_train \
-  --max_source_length 1024 \
-  --max_target_length 512 \
-  --learning_rate 2e-4 \
-  --num_train_epochs 3 \
-  --per_device_train_batch_size 32 \
-  --gradient_accumulation_steps 1 \
-  --lora_rank 8 \
-  --lora_dropout 0.1 \
-  --lora_target q_proj,v_proj \
-  --output_dir saves/ni-c012/LLAMA2-7B-Chat/lora/qa/bs32x1x1-3ep-bf16 \
-  --plot_loss True \
-  --bf16 True
-```
-
-### Step 2: run a CL method for next task (`qg` example)
-
-Use previous checkpoint from Step 1 via `--checkpoint_dir`.
-
-Non-rehearsal:
-```bash
---dataset ni_c012_qg_train
-```
-
-RandSel rehearsal:
-```bash
---dataset ni_c012_qg_train,ni_c012_qa_train_smp01
-```
-
-KMeansSel rehearsal:
-```bash
---dataset ni_c012_qg_train,ni_c012_qa_train_km20_smp01
-```
-
-SSR rehearsal:
-```bash
---dataset ni_c012_qg_train,ni_c012_icl_gen_km20_self_cl_queue_llama2_7b_chat_qa
-```
-
-All of the above use the same `train_bash.py` pattern as Step 1, but add:
-```bash
---checkpoint_dir <previous_task_ckpt>
-```
-
-### Step 3: evaluate each checkpoint
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python src/train_bash.py \
-  --stage sftrp \
-  --model_name_or_path /path/to/base/model \
-  --checkpoint_dir <ckpt_dir> \
-  --overwrite_cache True \
-  --predict_with_generate True \
-  --finetuning_type lora \
-  --template llama2 \
-  --dataset_dir data \
-  --dataset ni_c012_qg_eval \
-  --max_source_length 1024 \
-  --max_target_length 512 \
-  --per_device_eval_batch_size 1 \
-  --output_dir <ckpt_dir>/ni_c012_qg_eval \
-  --do_predict True \
-  --do_sample False \
-  --bf16 True
-```
-
-Metrics are saved in:
-- `<output_dir>/all_results.json`
-- `<output_dir>/generated_predictions.jsonl`
-
-## 7) Running the provided historical scripts
-
-After editing path variables, run directly:
-
-- Single-task init:
-```bash
-bash src/scripts-ni-c012/lora/sing/llama2-7b-chat/llama2-7b-chat.lora.single.3ep.bs32x1x1.bf16.sh qa 0
-```
-
-- Non-rehearsal CL sweep:
-```bash
-bash src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue.3ep.bs32x1x1.lr2e-04.bf16.sh 0
-```
-
-- RandSel CL sweep:
-```bash
-bash src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_rp.3ep.bs32x1x1.lr2e-04.bf16.sh 0 01
-```
-
-- KMeansSel CL sweep:
-```bash
-bash src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_km20_rp.3ep.bs32x1x1.lr2e-04.bf16.sh 0 01
-```
-
-- SSR CL sweep:
-```bash
-bash src/scripts-ni-c012/lora/cl/llama2-7b-chat/llama2-7b-chat.lora.cl_queue_iclgen_self.3ep.bs32x1x1.lr2e-04.bf16.sh 0
-```
-
-- Queue variants:
-```bash
-bash src/scripts-ni-c012/lora/cl2/llama2-7b-chat/llama2-7b-chat.lora.cl_queue2_iclgen_self.3ep.bs32x1x1.lr2e-04.bf16.sh 0
-bash src/scripts-ni-c012/lora/cl3/llama2-7b-chat/llama2-7b-chat.lora.cl_queue3_iclgen_self.3ep.bs32x1x1.lr2e-04.bf16.sh 0
-```
-
-These scripts are not the fastest path to a verified working run in this workspace; use `scripts/run_basic_ssr_5task.sh` if you want the maintained path.
-
-## 8) How to run SSR synthetic data generation
-
-Example flow (llama2-chat family):
-
-1. Generate synthetic instances:
-```bash
-bash custom/icl_gen/scripts-ni-c012/llama2-7b-chat/ori-van.sh 0 "qa qg sa sum trans" 2 3 1.2
-```
-
-2. Parse/filter generated files:
-- adapt and run `custom/icl_gen/parse_filter_generated.py`
-
-3. Refine synthetic outputs using current model:
-```bash
-bash custom/icl_gen/scripts-ni-c012/llama2-7b-chat/label-self.sh qa 0 "qg sa sum trans"
-```
-
-4. Select subset from the refined outputs:
-- random: `custom/icl_gen/random_select.py`
-- kmeans: compute embeddings first, then `custom/icl_gen/kmeans_self.py`
-- selector replay/dev path: `scripts/selection_methods.py` with `scripts/run_selection_proxy_iteration.py`
-
-Important:
-- These scripts also contain hardcoded paths and may need edits before use.
-- Dataset keys referenced by CL scripts are pre-registered in `data/dataset_info.json`.
-
-## 9) Data preprocessing from raw NI (if rebuilding dataset)
-
-The `ni-cus0.12` split files are already present. If you need to rebuild:
-
-1. Length filter raw NI task JSON:
-- `custom/niv2-c012/1_length_fiiter.py`
-2. Train/eval/extra split + sampled subsets:
-- `custom/niv2-c012/2_split_and_random_selection.py`
-3. (Optional) embedding + KMeans subset construction:
-- `custom/niv2-c012/text2emb.py`
-- `custom/niv2-c012/kmeans_selection.py`
-
-## 10) Useful outputs to inspect
-
-- Training logs/metrics per run: inside each `--output_dir`
-- Evaluation metrics: `<output_dir>/all_results.json`
-- Predictions: `<output_dir>/generated_predictions.jsonl`
-
-## 11) Common gotchas
-
-- Hardcoded paths in many research scripts are the #1 failure point.
-- `dataset_info.json` key names must match `--dataset` exactly.
-- The replay runner writes its own dataset registry under `<output_root>/proxy_data/dataset_info.json`; do not edit the global registry just to test a selector.
-- `--predict_with_generate True` is required for `sftrp` prediction output.
-- If output directory already exists and is non-empty, set unique `--output_dir` or `--overwrite_output_dir` as needed.
+If a script under `src/scripts-ni-c012/` references old absolute paths, ignore it for this workflow. The maintained path for this repo is the `scripts/run_paper_ssr_5task*.sh` and `scripts/run_paper_ssr_5task.py` stack.
