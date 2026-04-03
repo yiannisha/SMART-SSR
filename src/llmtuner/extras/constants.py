@@ -25,6 +25,14 @@ SUPPORTED_MODELS = {
     "LLaMA2-7B-Chat": "meta-llama/Llama-2-7b-chat-hf",
     "LLaMA2-13B-Chat": "meta-llama/Llama-2-13b-chat-hf",
     "LLaMA2-70B-Chat": "meta-llama/Llama-2-70b-chat-hf",
+    "LLaMA3-8B": "meta-llama/Meta-Llama-3-8B",
+    "LLaMA3-8B-Instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "LLaMA3.1-8B": "meta-llama/Llama-3.1-8B",
+    "LLaMA3.1-8B-Instruct": "meta-llama/Llama-3.1-8B-Instruct",
+    "LLaMA3.2-1B": "meta-llama/Llama-3.2-1B",
+    "LLaMA3.2-1B-Instruct": "meta-llama/Llama-3.2-1B-Instruct",
+    "LLaMA3.2-3B": "meta-llama/Llama-3.2-3B",
+    "LLaMA3.2-3B-Instruct": "meta-llama/Llama-3.2-3B-Instruct",
     "ChineseLLaMA2-7B": "ziqingyang/chinese-llama-2-7b",
     "ChineseLLaMA2-13B": "ziqingyang/chinese-llama-2-13b",
     "ChineseLLaMA2-7B-Chat": "ziqingyang/chinese-alpaca-2-7b",
@@ -50,6 +58,7 @@ SUPPORTED_MODELS = {
     "InternLM-7B-Chat": "internlm/internlm-chat-7b",
     "Qwen-7B": "Qwen/Qwen-7B",
     "Qwen-7B-Chat": "Qwen/Qwen-7B-Chat",
+    "Qwen3-4B-Instruct-2507": "Qwen/Qwen3-4B-Instruct-2507",
     "XVERSE-13B": "xverse/XVERSE-13B",
     "XVERSE-13B-Chat": "xverse/XVERSE-13B-Chat",
     "ChatGLM2-6B-Chat": "THUDM/chatglm2-6b"
@@ -58,6 +67,9 @@ SUPPORTED_MODELS = {
 DEFAULT_MODULE = {
     "LLaMA": "q_proj,v_proj",
     "LLaMA2": "q_proj,v_proj",
+    "LLaMA3": "q_proj,v_proj",
+    "LLaMA3.1": "q_proj,v_proj",
+    "LLaMA3.2": "q_proj,v_proj",
     "ChineseLLaMA2": "q_proj,v_proj",
     "BLOOM": "query_key_value",
     "BLOOMZ": "query_key_value",
@@ -66,17 +78,22 @@ DEFAULT_MODULE = {
     "Baichuan2": "W_pack",
     "InternLM": "q_proj,v_proj",
     "Qwen": "c_attn",
+    "Qwen3": "q_proj,v_proj",
     "XVERSE": "q_proj,v_proj",
     "ChatGLM2": "query_key_value"
 }
 
 DEFAULT_TEMPLATE = {
     "LLaMA2": "llama2",
+    "LLaMA3": "llama3",
+    "LLaMA3.1": "llama3",
+    "LLaMA3.2": "llama3",
     "ChineseLLaMA2": "llama2_zh",
     "Baichuan": "baichuan",
     "Baichuan2": "baichuan2",
     "InternLM": "intern",
     "Qwen": "chatml",
+    "Qwen3": "chatml",
     "XVERSE": "xverse",
     "ChatGLM2": "chatglm2"
 }

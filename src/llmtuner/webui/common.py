@@ -49,7 +49,7 @@ def get_model_path(model_name: str) -> str:
 
 
 def get_template(model_name: str) -> str:
-    if model_name.endswith("Chat") and model_name.split("-")[0] in DEFAULT_TEMPLATE:
+    if (model_name.endswith("Chat") or model_name.endswith("Instruct")) and model_name.split("-")[0] in DEFAULT_TEMPLATE:
         return DEFAULT_TEMPLATE[model_name.split("-")[0]]
     return "default"
 

@@ -2,6 +2,8 @@
 
 This guide is for the repository in its current state and focuses on the maintained path for a full 5-task SSR run with `meta-llama/Llama-2-7b-chat-hf` and the `hybrid_cluster` selector.
 
+The same maintained runner now also supports Llama 3 families including `llama3.1-8b-instruct`, `llama3.1-8b`, `llama3.2-1b-instruct`, `llama3.2-1b`, `llama3.2-3b-instruct`, and `llama3.2-3b`, plus Qwen 3 families such as `qwen3-4b-instruct-2507`.
+
 Use the maintained runners in `scripts/`. Do not start from the historical shell scripts under `src/scripts-ni-c012/`; many of those still assume old absolute paths.
 
 ## What this guide covers
@@ -35,7 +37,7 @@ Important details from the current code:
 - that wrapper auto-sources `keys.sh` if present
 - it auto-runs `scripts/bootstrap_env.sh`
 - the bootstrap creates `.venv`, installs a CUDA 12.1 PyTorch build, installs `requirements.txt`, and installs the repo editable
-- training and evaluation currently pass `--bf16 True`, so the maintained path assumes a BF16-capable GPU
+- training and evaluation now choose `--bf16` or `--fp16` automatically based on the local CUDA device
 
 ## 1. Fresh setup
 
@@ -84,7 +86,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 python -c "import transformers, peft, trl; print(transformers.__version__)"
 ```
 
-If `torch.cuda.is_bf16_supported()` prints `False`, the maintained paper runner will need code changes before it can run on that machine because the train/eval commands are hardcoded to BF16.
+If `torch.cuda.is_available()` prints `False`, the maintained paper runner can still parse args and build datasets locally, but practical 5-task SSR runs remain GPU-oriented.
 
 ## 2. The maintained 5-task runner
 
@@ -159,6 +161,45 @@ bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh \
   --hybrid_cluster_mean_kl_weight 2.0 \
   --hybrid_cluster_uncertainty_weight 6.0 \
   --output_root saves/paper-ssr-5task-llama2-7b-chat-hybrid-cluster-2-2-6
+```
+
+### 3.3 Llama 3 variants
+
+Llama 3 instruct variants use the shared `llama3` chat template automatically through `--model_family`.
+
+```bash
+python scripts/run_paper_ssr_5task.py \
+  --model_name_or_path meta-llama/Llama-3.1-8B-Instruct \
+  --model_family llama3.1-8b-instruct \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --sample_memory 200 \
+  --output_root saves/paper-ssr-5task-llama3.1-8b-instruct
+```
+
+Base Llama 3 variants use the `vanilla` training template.
+
+```bash
+python scripts/run_paper_ssr_5task.py \
+  --model_name_or_path meta-llama/Llama-3.2-3B \
+  --model_family llama3.2-3b \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --sample_memory 200 \
+  --output_root saves/paper-ssr-5task-llama3.2-3b
+```
+
+### 3.4 Qwen 3 variant
+
+`Qwen/Qwen3-4B-Instruct-2507` uses the shared `chatml` template for training, evaluation, and refinement, while raw candidate generation stays on the repo's maintained vanilla path so the existing parser keeps working.
+
+```bash
+bash scripts/run_paper_ssr_5task_qwen3_4b_instruct_2507.sh \
+  --cuda 0 \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --sample_memory 200 \
+  --output_root saves/paper-ssr-5task-qwen3-4b-instruct-2507
 ```
 
 ## 4. How the hybrid selector works in this repo

@@ -1,9 +1,9 @@
-torch>=1.13.1
-transformers==4.36.0
-datasets>=2.12.0
-accelerate>=0.21.0,<1.0.0
-peft==0.4.0
-trl==0.7.1
+torch>=2.4.1
+transformers==4.51.0
+datasets==2.21.0
+accelerate==0.34.2
+peft==0.13.2
+trl==0.9.6
 scipy
 sentencepiece
 protobuf
@@ -19,3 +19,4 @@ sse-starlette
 matplotlib
 jsonlines
 optimum
+rich

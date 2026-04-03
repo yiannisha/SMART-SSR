@@ -4,9 +4,10 @@ set -euo pipefail
 REPO_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${REPO_ROOT_DIR}/.venv"
 PYTHON_BIN="${VENV_DIR}/bin/python"
-STAMP_FILE="${VENV_DIR}/.smart_ssr_bootstrap_v2"
+STAMP_FILE="${VENV_DIR}/.smart_ssr_bootstrap_v4"
 
 TORCH_VERSION="${TORCH_VERSION:-2.4.1}"
+TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION:-4.51.0}"
 PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -16,7 +17,7 @@ fi
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 
-if [[ -f "${STAMP_FILE}" ]] && TORCH_VERSION_EXPECTED="${TORCH_VERSION}" python - <<'PY'
+if [[ -f "${STAMP_FILE}" ]] && TORCH_VERSION_EXPECTED="${TORCH_VERSION}" TRANSFORMERS_VERSION_EXPECTED="${TRANSFORMERS_VERSION}" python - <<'PY'
 import os
 import sys
 
@@ -32,8 +33,16 @@ try:
 except Exception:
     sys.exit(1)
 
-base_version = torch.__version__.split("+", 1)[0]
-sys.exit(0 if base_version == os.environ["TORCH_VERSION_EXPECTED"] else 1)
+torch_version = torch.__version__.split("+", 1)[0]
+transformers_version = transformers.__version__.split("+", 1)[0]
+sys.exit(
+    0
+    if (
+        torch_version == os.environ["TORCH_VERSION_EXPECTED"]
+        and transformers_version == os.environ["TRANSFORMERS_VERSION_EXPECTED"]
+    )
+    else 1
+)
 PY
 then
   exit 0

@@ -1,11 +1,8 @@
 from transformers import AutoTokenizer
 import transformers
 import torch
-import json
 import os
-import sys
 from tqdm import tqdm
-import copy
 import jsonlines
 
 # import importlib
@@ -14,25 +11,26 @@ import argparse
 from transformers import AutoModelForCausalLM
 from peft import PeftModelForCausalLM
 
-
-llama2_prompt = """<s> [INST] <<SYS>>
-You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
-
-If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.
-<</SYS>>
-
-{prompt} [/INST] """
+from llmtuner.extras.template import render_one_turn_prompt
 
 
-alpaca_prompt = \
-'''Below is an instruction that describes a task. Write a response that appropriately completes the request. 
+def get_dtype() -> torch.dtype:
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        return torch.float16
+    return torch.float32
 
-### Instruction:
-Generate an appropriate title for the given text. The generated title must be short and include the main topic of the text. The preferred titles are under fifteen words.
 
-{prompt}
-
-### Response:'''
+def build_pipeline(model, tokenizer):
+    pipeline_kwargs = {
+        "model": model,
+        "tokenizer": tokenizer,
+        "torch_dtype": get_dtype(),
+    }
+    if torch.cuda.is_available():
+        pipeline_kwargs["device_map"] = "auto"
+    return transformers.pipeline("text-generation", **pipeline_kwargs)
 
 
 def main(args):
@@ -41,30 +39,17 @@ def main(args):
     # model = args.model_name_or_path
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     if args.finetuning_type == "full":
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path if not args.ckpt_dir else args.ckpt_dir)
-        pipeline = transformers.pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            device="cuda"
-        )
+        pipeline = build_pipeline(model, tokenizer)
     else:
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
         model = PeftModelForCausalLM.from_pretrained(model, args.ckpt_dir)
         model = model.merge_and_unload()
-        # model = model.cuda()
-        pipeline = transformers.pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            device="cuda"
-        )
+        pipeline = build_pipeline(model, tokenizer)
 
     print("old model.config.use_cache:", pipeline.model.config.use_cache)
     pipeline.model.config.use_cache = True
@@ -93,12 +78,7 @@ def main(args):
             inputs = line['full_prompt']
         else:
             inputs = line['definition_input']
-        if args.template == "vanilla":
-            instruction = inputs
-        elif args.template == "llama2":
-            instruction = llama2_prompt.format(prompt=inputs)
-        elif args.template == "alpaca":
-            instruction = alpaca_prompt.format(prompt=inputs)
+        instruction = render_one_turn_prompt(tokenizer, args.template, inputs)
         print("========")
         print(instruction)
         print("--------")

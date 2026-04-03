@@ -41,7 +41,7 @@ source keys.sh
 ```
 
 The maintained shell wrappers now bootstrap `.venv` through `scripts/bootstrap_env.sh`.
-That bootstrap pins a CUDA 12.1 PyTorch build (`torch==2.4.1`) so the repo runs cleanly on the current A100/driver setup in this workspace.
+That bootstrap pins a CUDA 12.1 PyTorch build (`torch==2.4.1`) and installs a Qwen 3-compatible Transformers stack (`transformers==4.51.0`) so the maintained SSR runners work with Llama 2, Llama 3.1/3.2, and Qwen 3 families in this workspace.
 
 ## 🚀 Working 5-Task SSR Quickstart
 
@@ -152,6 +152,37 @@ bash scripts/run_paper_ssr_5task_llama2_7b_chat.sh \
   --skip_completed
 ```
 
+Llama 3.x examples:
+
+```bash
+python scripts/run_paper_ssr_5task.py \
+  --model_name_or_path meta-llama/Llama-3.1-8B-Instruct \
+  --model_family llama3.1-8b-instruct \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --output_root saves/paper-ssr-5task-llama3.1-8b-instruct
+```
+
+```bash
+python scripts/run_paper_ssr_5task.py \
+  --model_name_or_path meta-llama/Llama-3.2-3B \
+  --model_family llama3.2-3b \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --output_root saves/paper-ssr-5task-llama3.2-3b
+```
+
+Qwen 3 example:
+
+```bash
+bash scripts/run_paper_ssr_5task_qwen3_4b_instruct_2507.sh \
+  --cuda 0 \
+  --selector hybrid_cluster \
+  --candidate_source refined \
+  --sample_memory 200 \
+  --output_root saves/paper-ssr-5task-qwen3-4b-instruct-2507-hybrid-cluster
+```
+
 Replay outputs:
 
 - selected rehearsal files under `<output_root>/proxy_data/rehearsal/`
@@ -175,6 +206,8 @@ Notes:
 - The maintained paper-style runner now accepts `--selector` and writes stage-local dataset registries under `<output_root>/stage_data/<stage>/dataset_info.json`.
 - The paper-style runner shares only `raw` and `parsed` artifacts across runs. Checkpoint-dependent `refined` and compatibility `final/cl_queue` artifacts are written under `<output_root>/artifacts/`.
 - If you rerun the same `output_root` without `--skip_completed`, the runner refreshes `refined` and `final` for any retrained stage.
+- `--model_family` now accepts the maintained Llama 2 names, Llama 3 families such as `llama3.1-8b-instruct`, `llama3.1-8b`, `llama3.2-1b`, `llama3.2-1b-instruct`, `llama3.2-3b`, and `llama3.2-3b-instruct`, plus Qwen 3 families such as `qwen3-4b-instruct-2507`.
+- Instruct Llama 3 families use the shared `llama3` chat template for training/eval/refinement, base Llama 3 families use `vanilla`, and Qwen 3 instruct families use `chatml`.
 
 ## 🛢 Pipeline
 

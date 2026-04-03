@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Mapping
 
+import torch
+
 from selection_methods import (
     HYBRID_CLUSTER_SELECTOR_NAME,
     KMEANS_SELECTOR_N_CLUSTER,
@@ -30,24 +32,24 @@ from selection_methods import (
 
 
 TASKS = ["qa", "qg", "sa", "sum", "trans"]
-MODEL_SPECS = {
+EXPLICIT_MODEL_SPECS = {
     "tinyllama": {
         "train_template": "llama2",
         "gen_template": "vanilla",
         "model_tag": "tinyllama",
-        "dataset_key": lambda task: f"ni_c012_icl_gen_km20_self_cl_queue_tinyllama_{task}",
+        "lora_target": "q_proj,v_proj",
     },
     "llama2-7b-chat": {
         "train_template": "llama2",
         "gen_template": "vanilla",
         "model_tag": "llama2-7b-chat",
-        "dataset_key": lambda task: f"ni_c012_icl_gen_km20_self_cl_queue_llama2_7b_chat_{task}",
+        "lora_target": "q_proj,v_proj",
     },
     "llama2-7b": {
         "train_template": "vanilla",
         "gen_template": "vanilla",
         "model_tag": "llama2-7b",
-        "dataset_key": lambda task: f"ni_c012_icl_gen_km20_self_cl_queue_{task}",
+        "lora_target": "q_proj,v_proj",
     }
 }
 TRAIN_COLUMNS = {
@@ -78,6 +80,61 @@ POOLED_SELECTION_MODES = ("global", "per_task_top_ratio", "per_task_top_count", 
 
 def available_selectors() -> List[str]:
     return sorted(set(list_methods()) | POOLED_SELECTORS)
+
+
+def normalize_model_family_name(model_family: str) -> str:
+    normalized = model_family.strip().lower().split("/")[-1]
+    normalized = normalized.removesuffix("-hf")
+    if normalized.startswith("meta-llama-"):
+        normalized = normalized[len("meta-llama-"):]
+    if normalized.startswith("llama-2-"):
+        normalized = normalized.replace("llama-2-", "llama2-", 1)
+    elif normalized.startswith("llama-3."):
+        normalized = normalized.replace("llama-3.", "llama3.", 1)
+    elif normalized.startswith("llama-3-"):
+        normalized = normalized.replace("llama-3-", "llama3-", 1)
+    return normalized
+
+
+def resolve_model_spec(model_family: str) -> Dict[str, object]:
+    normalized = normalize_model_family_name(model_family)
+    explicit_spec = EXPLICIT_MODEL_SPECS.get(normalized)
+    if explicit_spec is not None:
+        return dict(explicit_spec)
+
+    if normalized.startswith("llama3"):
+        return {
+            "train_template": "llama3" if normalized.endswith("-instruct") else "vanilla",
+            "gen_template": "vanilla",
+            "model_tag": normalized,
+            "lora_target": "q_proj,v_proj",
+        }
+
+    if normalized.startswith("qwen3"):
+        return {
+            "train_template": "chatml" if "-instruct" in normalized else "vanilla",
+            "gen_template": "vanilla",
+            "model_tag": normalized,
+            "lora_target": "q_proj,v_proj",
+        }
+
+    raise ValueError(
+        "Unsupported model family `{}`. Supported explicit families: {}. "
+        "Llama 3 families are also supported via names like `llama3.1-8b-instruct`, "
+        "`llama3.1-8b`, `llama3.2-1b`, and `llama3.2-3b-instruct`. "
+        "Qwen 3 families are also supported via names like `qwen3-4b-instruct-2507`.".format(
+            model_family,
+            ", ".join(sorted(EXPLICIT_MODEL_SPECS)),
+        )
+    )
+
+
+def precision_flags() -> List[str]:
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return ["--bf16", "True"]
+    if torch.cuda.is_available():
+        return ["--fp16", "True"]
+    return []
 
 
 def resolve_pooled_selection_mode(
@@ -312,7 +369,8 @@ def run_single_task_train(
     num_train_epochs: float,
     max_samples: int,
     per_device_train_batch_size: int,
-    gradient_accumulation_steps: int
+    gradient_accumulation_steps: int,
+    lora_target: str,
 ) -> None:
     command = [
         python_bin,
@@ -340,11 +398,11 @@ def run_single_task_train(
         "--warmup_steps", "0",
         "--lora_rank", "8",
         "--lora_dropout", "0.1",
-        "--lora_target", "q_proj,v_proj",
+        "--lora_target", lora_target,
         "--resume_lora_training", "True",
         "--output_dir", str(output_dir),
         "--plot_loss", "True",
-        "--bf16", "True"
+        *precision_flags(),
     ]
     run_command(command, env)
 
@@ -363,7 +421,8 @@ def run_cl_train(
     num_train_epochs: float,
     max_samples: int,
     per_device_train_batch_size: int,
-    gradient_accumulation_steps: int
+    gradient_accumulation_steps: int,
+    lora_target: str,
 ) -> None:
     command = [
         python_bin,
@@ -392,11 +451,11 @@ def run_cl_train(
         "--warmup_steps", "0",
         "--lora_rank", "8",
         "--lora_dropout", "0.1",
-        "--lora_target", "q_proj,v_proj",
+        "--lora_target", lora_target,
         "--resume_lora_training", "True",
         "--output_dir", str(output_dir),
         "--plot_loss", "True",
-        "--bf16", "True"
+        *precision_flags(),
     ]
     run_command(command, env)
 
@@ -433,7 +492,7 @@ def run_eval(
         "--output_dir", str(output_dir),
         "--do_predict", "True",
         "--do_sample", "False",
-        "--bf16", "True"
+        *precision_flags(),
     ]
     run_command(command, env)
 
@@ -1095,7 +1154,7 @@ def save_aggregate_metrics(output_root: Path, tasks: List[str]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", required=True)
-    parser.add_argument("--model_family", choices=sorted(MODEL_SPECS), default="llama2-7b-chat")
+    parser.add_argument("--model_family", default="llama2-7b-chat")
     parser.add_argument("--output_root", default="saves/paper-ssr-5task")
     parser.add_argument("--tasks", nargs="+", default=TASKS)
     parser.add_argument("--cuda", default="0")
@@ -1147,7 +1206,7 @@ def main() -> None:
     env = repo_env(args.cuda)
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    spec = MODEL_SPECS[args.model_family]
+    spec = resolve_model_spec(args.model_family)
     candidate_source = resolve_candidate_source(args.selector, args.candidate_source)
     pooled_selection_mode = resolve_pooled_selection_mode(
         args.selector,
@@ -1250,7 +1309,8 @@ def main() -> None:
                     num_train_epochs=args.num_train_epochs,
                     max_samples=args.max_samples,
                     per_device_train_batch_size=args.per_device_train_batch_size,
-                    gradient_accumulation_steps=args.gradient_accumulation_steps
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    lora_target=spec["lora_target"],
                 )
             else:
                 run_cl_train(
@@ -1267,8 +1327,9 @@ def main() -> None:
                     num_train_epochs=args.num_train_epochs,
                     max_samples=args.max_samples,
                     per_device_train_batch_size=args.per_device_train_batch_size,
-                        gradient_accumulation_steps=args.gradient_accumulation_steps
-                    )
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    lora_target=spec["lora_target"],
+                )
 
         if should_train_stage or not paths["refined"].exists():
             run_refinement(

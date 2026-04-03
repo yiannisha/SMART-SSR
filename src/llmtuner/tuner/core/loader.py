@@ -38,11 +38,11 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-check_min_version("4.30.0")
-require_version("datasets>=2.12.0", "To fix: pip install datasets>=2.12.0")
-require_version("accelerate>=0.21.0", "To fix: pip install accelerate>=0.21.0")
-require_version("peft==0.4.0", "To fix: pip install peft==0.4.0")
-require_version("trl>=0.7.1", "To fix: pip install trl>=0.7.1")
+check_min_version("4.51.0")
+require_version("datasets>=2.21.0", "To fix: pip install datasets>=2.21.0")
+require_version("accelerate>=0.34.0", "To fix: pip install accelerate>=0.34.0")
+require_version("peft>=0.13.0", "To fix: pip install peft>=0.13.0")
+require_version("trl>=0.9.0", "To fix: pip install trl>=0.9.0")
 
 
 def load_model_and_tokenizer(

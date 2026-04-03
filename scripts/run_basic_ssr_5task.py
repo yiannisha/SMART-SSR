@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+import torch
+
 from ssr_metrics import save_aggregate_metrics
 
 
@@ -26,6 +28,14 @@ MODEL_SPECS = {
         ),
     },
 }
+
+
+def precision_flags() -> List[str]:
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return ["--bf16", "True"]
+    if torch.cuda.is_available():
+        return ["--fp16", "True"]
+    return []
 
 
 def repo_env(cuda: str) -> Dict[str, str]:
@@ -96,7 +106,7 @@ def run_train(
         "--resume_lora_training", "True",
         "--output_dir", str(output_dir),
         "--plot_loss", "False",
-        "--bf16", "True"
+        *precision_flags(),
     ]
     if checkpoint is not None and checkpoint.exists():
         command.extend(["--checkpoint_dir", str(checkpoint)])
@@ -134,7 +144,7 @@ def run_eval(
         "--output_dir", str(output_dir),
         "--do_predict", "True",
         "--do_sample", "False",
-        "--bf16", "True"
+        *precision_flags(),
     ]
     run_command(command, env)
 

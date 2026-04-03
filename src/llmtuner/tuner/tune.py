@@ -3,13 +3,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from llmtuner.extras.callbacks import LogCallback
 from llmtuner.extras.logging import get_logger
 from llmtuner.tuner.core import get_train_args, load_model_and_tokenizer
-from llmtuner.tuner.pt import run_pt
-from llmtuner.tuner.sft import run_sft
-from llmtuner.tuner.sftrp import run_sftrp
-from llmtuner.tuner.sftreg import run_sftreg
-from llmtuner.tuner.rm import run_rm
-from llmtuner.tuner.ppo import run_ppo
-from llmtuner.tuner.dpo import run_dpo
 
 if TYPE_CHECKING:
     from transformers import TrainerCallback
@@ -23,18 +16,25 @@ def run_exp(args: Optional[Dict[str, Any]] = None, callbacks: Optional[List["Tra
     callbacks = [LogCallback()] if callbacks is None else callbacks
 
     if general_args.stage == "pt":
+        from llmtuner.tuner.pt import run_pt
         run_pt(model_args, data_args, training_args, finetuning_args, callbacks)
     elif general_args.stage == "sft":
+        from llmtuner.tuner.sft import run_sft
         run_sft(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     elif general_args.stage == "sftrp":
+        from llmtuner.tuner.sftrp import run_sftrp
         run_sftrp(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     elif general_args.stage == "sftreg":
+        from llmtuner.tuner.sftreg import run_sftreg
         run_sftreg(model_args, data_args, training_args, finetuning_args, generating_args, general_args.reg_cl_method, general_args.reg_p, callbacks)
     elif general_args.stage == "rm":
+        from llmtuner.tuner.rm import run_rm
         run_rm(model_args, data_args, training_args, finetuning_args, callbacks)
     elif general_args.stage == "ppo":
+        from llmtuner.tuner.ppo import run_ppo
         run_ppo(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     elif general_args.stage == "dpo":
+        from llmtuner.tuner.dpo import run_dpo
         run_dpo(model_args, data_args, training_args, finetuning_args, callbacks)
     else:
         raise ValueError("Unknown task.")

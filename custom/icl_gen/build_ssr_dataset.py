@@ -11,14 +11,7 @@ import torch
 from peft import PeftModelForCausalLM
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, set_seed
 
-
-LLAMA2_PROMPT = """<s> [INST] <<SYS>>
-You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
-
-If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.
-<</SYS>>
-
-{prompt} [/INST] """
+from llmtuner.extras.template import render_one_turn_prompt
 
 
 def cleanup_model(model_pipeline=None):
@@ -184,9 +177,7 @@ def refine_candidates(
 
     try:
         for row in candidates:
-            prompt = row["inputs"]
-            if template == "llama2":
-                prompt = LLAMA2_PROMPT.format(prompt=prompt)
+            prompt = render_one_turn_prompt(tokenizer, template, row["inputs"])
 
             generations = gen_pipeline(
                 prompt,

@@ -177,6 +177,35 @@ class Llama2Template(Template):
         return encoded_pairs
 
 
+@dataclass
+class Llama3Template(Template):
+
+    def _encode(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        system: str,
+        history: List[Tuple[str, str]]
+    ) -> List[Tuple[List[int], List[int]]]:
+        r"""
+        Encodes formatted inputs to pairs of token ids.
+        Turn 0: bos + system + user + assistant    resp
+        Turn t: eot + user + assistant             resp
+        """
+        bos_ids, eos_ids = self._get_special_ids(tokenizer)
+        prefix_ids = self._convert_inputs_to_ids(tokenizer, context=self.prefix, system=system)
+        sep_ids = self._convert_inputs_to_ids(tokenizer, context=self.sep)
+        encoded_pairs = []
+        for turn_idx, (query, resp) in enumerate(history):
+            query_ids = self._convert_inputs_to_ids(tokenizer, context=self.prompt, query=query)
+            resp_ids = self._convert_inputs_to_ids(tokenizer, context=[resp])
+            if turn_idx == 0:
+                source_ids = bos_ids + prefix_ids + query_ids
+            else:
+                source_ids = sep_ids + query_ids
+            encoded_pairs.append((source_ids, resp_ids + eos_ids))
+        return encoded_pairs
+
+
 templates: Dict[str, Template] = {}
 
 
@@ -190,7 +219,12 @@ def register_template(
     use_history: Optional[bool] = True,
     efficient_eos: Optional[bool] = False
 ) -> None:
-    template_class = Llama2Template if "llama2" in name else Template
+    if "llama2" in name:
+        template_class = Llama2Template
+    elif "llama3" in name:
+        template_class = Llama3Template
+    else:
+        template_class = Template
     templates[name] = template_class(
         prefix=prefix,
         prompt=prompt,
@@ -202,10 +236,25 @@ def register_template(
     )
 
 
+def has_token(tokenizer: "PreTrainedTokenizer", token: str) -> bool:
+    token_id = tokenizer.convert_tokens_to_ids(token)
+    if token_id is None:
+        return False
+    unk_token_id = getattr(tokenizer, "unk_token_id", None)
+    unk_token = getattr(tokenizer, "unk_token", None)
+    if unk_token_id is not None and token_id == unk_token_id and token != unk_token:
+        return False
+    return True
+
+
 def get_template_and_fix_tokenizer(
     name: str,
     tokenizer: "PreTrainedTokenizer"
 ) -> Template:
+    if name == "llama3" and has_token(tokenizer, "<|eot_id|>") and tokenizer.eos_token != "<|eot_id|>":
+        tokenizer.eos_token = "<|eot_id|>"
+        logger.info("Set eos token to <|eot_id|> for llama3 template.")
+
     if tokenizer.eos_token_id is None:
         tokenizer.eos_token = "<|endoftext|>"
         logger.info("Add eos token: {}".format(tokenizer.eos_token))
@@ -224,6 +273,27 @@ def get_template_and_fix_tokenizer(
         replace_additional_special_tokens=False
     )
     return template
+
+
+def render_one_turn_prompt(
+    tokenizer: "PreTrainedTokenizer",
+    name: Optional[str],
+    query: str,
+    history: Optional[List[Tuple[str, str]]] = None,
+    system: Optional[str] = None
+) -> str:
+    if name in (None, "vanilla"):
+        return query
+
+    template = get_template_and_fix_tokenizer(name, tokenizer)
+    prompt_ids, _ = template.encode_oneturn(
+        tokenizer=tokenizer,
+        query=query,
+        resp="",
+        history=history,
+        system=system,
+    )
+    return tokenizer.decode(prompt_ids, skip_special_tokens=False)
 
 
 r"""
@@ -286,6 +356,34 @@ register_template(
         "If you don't know the answer to a question, please don't share false information."
     ),
     sep=[]
+)
+
+
+r"""
+Supports: https://huggingface.co/meta-llama/Llama-3-8B-Instruct
+          https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
+          https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct
+          https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct
+"""
+register_template(
+    name="llama3",
+    prefix=[
+        "<|start_header_id|>system<|end_header_id|>\n\n{{system}}",
+        {"token": "<|eot_id|>"}
+    ],
+    prompt=[
+        "<|start_header_id|>user<|end_header_id|>\n\n{{query}}",
+        {"token": "<|eot_id|>"},
+        "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    ],
+    system="You are a helpful assistant.",
+    sep=[
+        {"token": "<|eot_id|>"}
+    ],
+    stop_words=[
+        "<|eot_id|>"
+    ],
+    efficient_eos=True
 )
 
 # register_template(

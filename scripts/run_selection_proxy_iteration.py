@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Mapping
 
+import torch
+
 from selection_methods import (
     HYBRID_CLUSTER_SELECTOR_NAME,
     KMEANS_SELECTOR_N_CLUSTER,
@@ -66,6 +68,14 @@ def selector_output_name(selector: str, pooled_selection_mode: str) -> str:
     if selector not in POOLED_SELECTORS or pooled_selection_mode == "global":
         return selector
     return f"{selector}-{pooled_selection_mode}"
+
+
+def precision_flags() -> List[str]:
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return ["--bf16", "True"]
+    if torch.cuda.is_available():
+        return ["--fp16", "True"]
+    return []
 
 
 def repo_env(cuda: str) -> Dict[str, str]:
@@ -228,7 +238,7 @@ def run_train(
         "--resume_lora_training", "True",
         "--output_dir", str(output_dir),
         "--plot_loss", "True",
-        "--bf16", "True",
+        *precision_flags(),
     ]
     if checkpoint is not None and checkpoint.exists():
         command.extend(["--checkpoint_dir", str(checkpoint)])
@@ -273,7 +283,7 @@ def run_eval(
         "--output_dir", str(output_dir),
         "--do_predict", "True",
         "--do_sample", "False",
-        "--bf16", "True",
+        *precision_flags(),
     ]
     if max_samples is not None:
         command.extend(["--max_samples", str(max_samples)])
