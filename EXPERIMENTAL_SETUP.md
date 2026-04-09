@@ -23,10 +23,13 @@ The hybrid weight vector is listed as:
 | W1 | `[0, 0, 1]` | uncertainty only |
 | W2 | `[0, 1, 0]` | mean-KL only |
 | W3 | `[1, 0, 0]` | diversity only |
-| W4 | `[0.2, 0.6, 0.2]` | mean-KL heavy |
+| W4 | `[0.33, 0.33, 0.33]` | near-equal weighting |
 | W5 | `[0.2, 0.2, 0.6]` | uncertainty heavy |
-| W6 | `[0.33, 0.33, 0.33]` | near-equal weighting |
+| W5 | `[0.2, 0.6, 0.2]` | mean-KL heavy |
 | W7 | `[0.6, 0.2, 0.2]` | diversity heavy |
+| W8 | `[0.3, 0.3, 0.4]` |
+| W9 | `[0.3, 0.4, 0.3]` |
+| W10 | `[0.4, 0.3, 0.3]` |
 
 ## Runnable Today
 
